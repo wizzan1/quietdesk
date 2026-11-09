@@ -282,7 +282,7 @@ static class Tone {
 }
 '@
     $freshTone = Join-Path $here 'fresh-tone.exe'
-    & "$env:WINDIR\Microsoft.NET\Framework644.0.30319\csc.exe" /nologo /target:exe "/out:$freshTone" $toneSource | Out-Null
+    & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe "/out:$freshTone" $toneSource | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'the fresh tone program did not compile' }
     $frequency = [Diagnostics.Stopwatch]::Frequency
     $delays = @()

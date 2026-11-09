@@ -1010,6 +1010,7 @@ pub fn keep() -> i32 {
         let mut loops = 0u32;
         let mut looks_without_display = 0u32;
         let mut layout_changes: Vec<Instant> = Vec::new();
+        let mut corner_problem: Option<String> = None;
         loop {
             if loops.is_multiple_of(FAMILY_EVERY_LOOPS) {
                 let in_jobs = commands.processes();
@@ -1022,20 +1023,29 @@ pub fn keep() -> i32 {
                     Some(display) => {
                         looks_without_display = 0;
                         layout_changes.retain(|at| at.elapsed() < LAYOUT_CHANGE_WINDOW);
-                        // A change of the user's screens can move it: windows go where it is now. It can also put it beside one
-                        // of them, where the mouse crosses onto it: then it goes back to a corner.
-                        if let Some(now) = bounds_of(&display)
-                            && now != bounds
-                        {
+                        // A change of the user's screens can put it beside one of them, where the mouse crosses onto it: then it
+                        // goes back to a corner. Looked at every time, not only when it moved: Windows may settle the layout only
+                        // after a look that found it half way, as when a screen is turned on.
+                        if let Some(now) = bounds_of(&display) {
                             let theirs: Vec<Bounds> = active_displays().iter().filter(|d| !d.is_virtual).filter_map(bounds_of).collect();
                             if !apart(&now, &theirs) && layout_changes.len() < LAYOUT_CHANGES {
                                 layout_changes.push(Instant::now());
-                                if let Err(error) = move_to_a_corner(&display) {
-                                    note_problem(&format!("a change of your screens put the virtual monitor beside one, and it could not go back to a corner: {error}"));
+                                match move_to_a_corner(&display) {
+                                    Ok(()) => corner_problem = None,
+                                    // Noted once, not at every try.
+                                    Err(error) if corner_problem.as_deref() != Some(error.to_string().as_str()) => {
+                                        note_problem(&format!("the virtual monitor is beside one of your screens, and it could not go to a corner yet: {error}"));
+                                        corner_problem = Some(error.to_string());
+                                    }
+                                    Err(_) => {}
                                 }
                             }
-                            bounds = bounds_of(&display).unwrap_or(now);
-                            record_bounds(&bounds);
+                            // Windows go where it is now.
+                            let now = bounds_of(&display).unwrap_or(now);
+                            if now != bounds {
+                                bounds = now;
+                                record_bounds(&bounds);
+                            }
                         }
                     }
                     None => looks_without_display += 1,
