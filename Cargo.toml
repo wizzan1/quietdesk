@@ -46,6 +46,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
 ] }
+# The `implement` macro, for the sound guard's callback, names this crate in the code it writes; it is the one `windows` uses.
+windows-core = "0.62"
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Display",

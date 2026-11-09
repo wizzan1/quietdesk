@@ -1,6 +1,6 @@
 <#
 Proves the sound guard with a real tone and Windows' own audio session state, against the installed programs and the running tray:
-a hidden run is muted, window or no window; the same program launched normally gets its sound at once and leaves the list; a copy already running
+a hidden run is muted, window or no window, and new hidden sound is muted before it can be heard; the same program launched normally gets its sound at once and leaves the list; a copy already running
 is not touched and does not clear the list; with the option off nothing is muted; a guard killed mid-mute repairs itself; other
 apps are left alone. It opens small windows, can be heard for a moment, restarts the tray, and with the mode off plugs in the virtual
 monitor, so not during your game.
@@ -237,7 +237,7 @@ try {
     $tone = Start-Tone 'visible' 25 'e'
     $withoutGuard = Watch-Mute $tone.Id 500
     "  with no guard running, Windows started it muted: $($withoutGuard.Last)"
-    Start-Process -FilePath (Join-Path $bin 'quietdesk.exe') -ArgumentList 'visible', "`"$(Join-Path $bin 'quietdesk-tray.exe')`"" -WindowStyle Hidden
+    & (Join-Path $bin 'quietdesk.exe') start-tray
     Start-Sleep -Milliseconds 1200
     $watch = Watch-Mute $tone.Id 800
     Report 'the guard gives it its sound back within a second' ($watch.Samples -gt 0 -and $watch.Last -eq $false) "last muted=$($watch.Last)"
@@ -263,14 +263,72 @@ try {
     Restore-TestPrograms -Report
     Report 'the list is empty again' (-not (Read-MutedList)) (Read-MutedList)
 
-    "--- 6. your other apps"
+    "--- 6. new hidden sound is muted before it can be heard"
+    # A fresh copy of a tiny tone program each time, so Windows has no mute remembered for it: only the guard can have muted it. The
+    # tone notes the moment it starts playing on the system-wide clock; its session is watched as closely as this script can.
+    $toneSource = Join-Path $here 'fresh-tone.cs'
+    Set-Content -LiteralPath $toneSource -Encoding ascii -Value @'
+using System; using System.Diagnostics; using System.IO; using System.Media; using System.Threading;
+static class Tone {
+    static void Main(string[] args) {
+        var player = new SoundPlayer(args[0]);
+        player.Load();
+        long at = Stopwatch.GetTimestamp();
+        player.PlayLooping();
+        File.WriteAllText(args[1], Process.GetCurrentProcess().Id + " " + at);
+        Thread.Sleep(1500);
+        player.Stop();
+    }
+}
+'@
+    $freshTone = Join-Path $here 'fresh-tone.exe'
+    & "$env:WINDIR\Microsoft.NET\Framework644.0.30319\csc.exe" /nologo /target:exe "/out:$freshTone" $toneSource | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'the fresh tone program did not compile' }
+    $frequency = [Diagnostics.Stopwatch]::Frequency
+    $delays = @()
+    $copies = @()
+    foreach ($run in 1..5) {
+        $copy = Join-Path $here "fresh-tone-$([guid]::NewGuid().ToString('N')).exe"
+        Copy-Item -LiteralPath $freshTone -Destination $copy
+        $copies += $copy
+        $note = Join-Path $here "fresh-$run.txt"
+        $wrapper = Start-Process -FilePath (Join-Path $bin 'quietdesk.exe') -ArgumentList 'hidden', "`"$copy`"", "`"$wav`"", "`"$note`"" -PassThru -WindowStyle Hidden
+        $tonePid = $null; $playAt = $null; $seenAt = $null; $mutedAt = $null
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt 3000 -and -not $mutedAt) {
+            if (-not $tonePid) {
+                $words = "$(Get-Content -Raw -LiteralPath $note -ErrorAction SilentlyContinue)".Trim() -split ' '
+                if ($words.Count -eq 2) { $tonePid = [int]$words[0]; $playAt = [long]$words[1] }
+            }
+            $now = [Diagnostics.Stopwatch]::GetTimestamp()
+            foreach ($session in @([Sessions]::All() | Where-Object { $tonePid -and $_.Pid -eq $tonePid })) {
+                if (-not $seenAt) { $seenAt = $now }
+                if ($session.Muted) { $mutedAt = $now }
+            }
+        }
+        [void]$wrapper.WaitForExit(5000)
+        # From the first look that found its session to the first that found it muted: 0 when it was muted as soon as it was seen.
+        $delays += $(if ($seenAt -and $mutedAt) { [math]::Round(($mutedAt - $seenAt) * 1000.0 / $frequency) } else { 'never' })
+        "  run ${run}: session seen $(if ($seenAt) { [math]::Round(($seenAt - $playAt) * 1000.0 / $frequency) } else { '-' }) ms after it began to play, muted $(if ($mutedAt) { [math]::Round(($mutedAt - $playAt) * 1000.0 / $frequency) } else { 'never' }) ms after"
+    }
+    # A tick of 0.2 s let it play for up to that long; announced, it is muted within one look of this script.
+    Report 'new hidden sound is muted as soon as it is seen' (@($delays | Where-Object { $_ -isnot [double] -or $_ -gt 20 }).Count -eq 0) "ms from seen to muted: $($delays -join ', ')"
+    # Windows remembers each copy as muted, as it would a real test's program; gone, they leave the list when the guard starts.
+    Start-Sleep -Milliseconds 500
+    Remove-Item -LiteralPath $copies -Force -ErrorAction SilentlyContinue
+    Stop-QuietDeskTray
+    & (Join-Path $bin 'quietdesk.exe') start-tray
+    Start-Sleep -Milliseconds 1500
+    Report 'programs that are gone leave the list when the tray starts' (-not (Read-MutedList)) (Read-MutedList)
+
+    "--- 7. your other apps"
     $othersAfter = @([Sessions]::All() | Where-Object { $_.Name -ne 'powershell' } | ForEach-Object { "$($_.Name)=$($_.Muted)" } | Sort-Object)
     $changed = @($othersBefore | Where-Object { $_ -like '*=True' -and $othersAfter -notcontains $_ }) + @($othersAfter | Where-Object { $_ -like '*=True' -and $othersBefore -notcontains $_ })
     Report 'no other app was muted or unmuted' ($changed.Count -eq 0) "$($othersAfter -join ', ')"
 }
 finally {
     Set-Muting $settingBefore
-    if (-not (Get-Process quietdesk-tray -ErrorAction SilentlyContinue)) { Start-Process -FilePath (Join-Path $bin 'quietdesk.exe') -ArgumentList 'visible', "`"$(Join-Path $bin 'quietdesk-tray.exe')`"" -WindowStyle Hidden }
+    if (-not (Get-Process quietdesk-tray -ErrorAction SilentlyContinue)) { & (Join-Path $bin 'quietdesk.exe') start-tray }
     Remove-Item -LiteralPath $here -Recurse -Force -ErrorAction SilentlyContinue
 }
 "failures: $failures"

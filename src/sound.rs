@@ -15,15 +15,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
-    eRender,
+    DEVICE_STATE_ACTIVE, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2, IAudioSessionNotification,
+    IAudioSessionNotification_Impl, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree};
-use windows::core::{GUID, Interface};
+use windows::core::{GUID, Interface, Ref, implement};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 use crate::{Desktop, desktop_is_hidden, monitor, note_problem, process_path, state_dir};
 
-/// How often new sound is looked for. Sound from a run can be heard for at most this long.
+/// How often the guard looks even when no new sound was announced: for a program on the monitor whose sound began before it was
+/// known to be a test's, and for outputs that came or went. New sound wakes it at once.
 pub const GUARD_TICK: Duration = Duration::from_millis(200);
 /// A process's ancestors, as far as a test's audio helper can be from its window.
 const MOST_ANCESTORS: usize = 16;
@@ -102,9 +105,30 @@ struct Muted {
     program: String,
 }
 
+/// Wakes the guard the moment any program opens a new audio session, which is before it plays. Waiting for the next tick instead let
+/// a hidden test be heard for 25 to 190 ms (measured with a 200 ms tick). It only wakes the guard: the guard's own thread mutes, so a
+/// program is always written down before its mute.
+#[implement(IAudioSessionNotification)]
+struct NewSound {
+    wake: usize,
+}
+
+impl IAudioSessionNotification_Impl for NewSound_Impl {
+    fn OnSessionCreated(&self, _session: Ref<IAudioSessionControl>) -> windows::core::Result<()> {
+        unsafe { SetEvent(self.wake as HANDLE) };
+        Ok(())
+    }
+}
+
 pub struct Guard {
     devices: IMMDeviceEnumerator,
     outputs: Vec<IAudioSessionManager2>,
+    /// Windows' names for the outputs above: only a change of them makes the guard open them anew.
+    output_names: Vec<String>,
+    /// Each output's announcer of new sound, for taking it back.
+    listeners: Vec<(IAudioSessionManager2, IAudioSessionNotification)>,
+    /// Set by an announcer; the guard waits on it between ticks.
+    wake: HANDLE,
     ticks_until_outputs_look: u32,
     muted: HashMap<u32, Muted>,
     /// Programs Windows may still start muted, from runs that ended; the list file keeps them across restarts.
@@ -121,26 +145,75 @@ impl Guard {
             CoInitializeEx(Some(null()), COINIT_MULTITHREADED).ok()?;
             let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             // A program that no longer exists cannot start silent: test builds in scratch folders would otherwise pile up here.
-            let left_muted = std::fs::read_to_string(list_file())
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| !line.is_empty() && std::path::Path::new(line).exists())
-                .map(str::to_string)
-                .collect();
-            Ok(Self { devices, outputs: Vec::new(), ticks_until_outputs_look: 0, muted: HashMap::new(), left_muted, hidden: HashMap::new() })
+            let listed = std::fs::read_to_string(list_file()).unwrap_or_default();
+            let listed: Vec<&str> = listed.lines().filter(|line| !line.is_empty()).collect();
+            let left_muted: HashSet<String> = listed.iter().filter(|line| std::path::Path::new(line).exists()).map(|line| line.to_string()).collect();
+            let gone = left_muted.len() < listed.len();
+            let wake = CreateEventW(null(), 0, 0, null());
+            if wake.is_null() {
+                return Err(windows::core::Error::from_thread());
+            }
+            let guard = Self {
+                devices,
+                outputs: Vec::new(),
+                output_names: Vec::new(),
+                listeners: Vec::new(),
+                wake,
+                ticks_until_outputs_look: 0,
+                muted: HashMap::new(),
+                left_muted,
+                hidden: HashMap::new(),
+            };
+            if gone {
+                guard.write_list();
+            }
+            Ok(guard)
         }
     }
 
+    /// Opens the active outputs and has each announce new sound, unless they are the ones already open.
     fn look_for_outputs(&mut self) -> windows::core::Result<()> {
         unsafe {
             let outputs = self.devices.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-            let mut managers = Vec::new();
+            let mut devices = Vec::new();
+            let mut names = Vec::new();
             for index in 0..outputs.GetCount()? {
-                managers.push(outputs.Item(index)?.Activate(CLSCTX_ALL, None)?);
+                let device = outputs.Item(index)?;
+                let name = device.GetId()?;
+                names.push(name.to_string().unwrap_or_default());
+                CoTaskMemFree(Some(name.0 as *const _));
+                devices.push(device);
+            }
+            if names == self.output_names {
+                return Ok(());
+            }
+            self.stop_listening();
+            let mut managers = Vec::new();
+            for device in devices {
+                let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+                let listener: IAudioSessionNotification = NewSound { wake: self.wake as usize }.into();
+                // Without it new sound waits for the next tick, as it always did: noted, and the guard goes on.
+                match manager.RegisterSessionNotification(&listener) {
+                    Ok(()) => self.listeners.push((manager.clone(), listener)),
+                    Err(error) => note_problem(&format!("an output will not announce new sound, so a test may be heard for up to 0.2 s: {error}")),
+                }
+                managers.push(manager);
             }
             self.outputs = managers;
+            self.output_names = names;
         }
         Ok(())
+    }
+
+    fn stop_listening(&mut self) {
+        for (manager, listener) in self.listeners.drain(..) {
+            let _ = unsafe { manager.UnregisterSessionNotification(&listener) };
+        }
+    }
+
+    /// Until new sound is announced, or a tick has passed.
+    fn wait(&self) {
+        unsafe { WaitForSingleObject(self.wake, GUARD_TICK.as_millis() as u32) };
     }
 
     /// Every audio session on every active output: its process and its mute control. An output that went away fails here, and
@@ -153,7 +226,9 @@ impl Guard {
         self.ticks_until_outputs_look -= 1;
         let found = self.sessions_on_known_outputs();
         if found.is_err() {
+            // Opened anew at the next tick, even if Windows still names the same outputs.
             self.ticks_until_outputs_look = 0;
+            self.output_names.clear();
         }
         found
     }
@@ -214,7 +289,6 @@ impl Guard {
         if !enabled && self.muted.is_empty() && self.left_muted.is_empty() {
             return;
         }
-        let on_monitor = if enabled { monitor_processes() } else { HashSet::new() };
         let sessions = match self.sessions() {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -227,8 +301,13 @@ impl Guard {
         let mut tests = HashSet::new();
         let playing: HashSet<u32> = sessions.iter().map(|session| session.pid).collect();
         self.hidden.retain(|pid, _| playing.contains(pid));
-        for Session { pid, instance, volume } in sessions {
-            if enabled && (on_monitor.contains(&pid) || self.runs_hidden(pid)) {
+        // Hidden programs first: telling them apart is a read of each process, while the monitor's processes cost a look at every
+        // window and process, which new hidden sound must not wait for.
+        let (hidden, others): (Vec<Session>, Vec<Session>) = sessions.into_iter().partition(|session| enabled && self.runs_hidden(session.pid));
+        let mut on_monitor: Option<HashSet<u32>> = None;
+        let hidden = hidden.into_iter().map(|session| (session, true));
+        for (Session { pid, instance, volume }, is_hidden) in hidden.chain(others.into_iter().map(|session| (session, false))) {
+            if is_hidden || (enabled && on_monitor.get_or_insert_with(monitor_processes).contains(&pid)) {
                 tests.insert(pid);
                 if let Entry::Vacant(slot) = self.muted.entry(pid) {
                     // Written down before the mute, so no crash can leave a mute nobody knows about.
@@ -274,6 +353,13 @@ impl Guard {
     }
 }
 
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.stop_listening();
+        unsafe { CloseHandle(self.wake) };
+    }
+}
+
 impl Guard {
     /// Takes back every mute it still can, and leaves the rest on the list for the next time the guard runs.
     fn release(&mut self) {
@@ -305,7 +391,7 @@ pub fn run_guard(stop: &AtomicBool) {
     };
     while !stop.load(Ordering::Relaxed) {
         guard.tick();
-        std::thread::sleep(GUARD_TICK);
+        guard.wait();
     }
     guard.release();
 }

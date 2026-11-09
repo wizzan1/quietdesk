@@ -16,7 +16,8 @@ It works with Claude Code today. The name is not tied to it: other agents, such 
   (see the limits below). Nothing in your projects or in how the agent works changes.
 - **A virtual monitor** for what cannot run hidden, such as a check of what the display shows, or an app that refuses a hidden
   desktop. Out of sight, but to Windows a real display.
-- **Silent test runs:** what runs out of sight is muted. Your own apps and games keep their sound.
+- **Silent test runs:** what runs out of sight is muted the moment it opens its sound, before it is heard. Your own apps and games
+  keep their sound.
 - **Your focus back:** if a test window takes the focus anyway, it is given back.
 - **One switch for every session:** the tray icon, `quietdesk on` and `quietdesk off`, or just ask the agent.
 - **No weaker tests:** the agent is told never to test less because of it, and how to handle what behaves differently hidden.
@@ -100,8 +101,12 @@ wander onto it, and follows everything a command starts, so the command's window
 
 ## What it cannot hide
 
-- **The moment of opening** on the virtual monitor: a window can flash on your screen for up to 0.8 seconds.
-- **The first moment of sound:** the guard looks every 0.2 seconds.
+- **A window on the virtual monitor whose program is busy as it opens.** A program that puts its own window on your screen has it
+  moved off within milliseconds, but only once it is free: Windows lets only a window's own thread move it. One that is busy as its
+  window opens, as a game is while it loads, keeps it on your screen until then. The one way to hide it from outside would change how
+  it draws, and so what is tested.
+- **Sound from the virtual monitor that starts before its program is known as a test's,** such as one started outside the command:
+  muted at the guard's next look, within 0.2 seconds.
 - **GPU load:** a hidden game still uses your GPU, so cap test frame rates if you play at the same time.
 - **Questions:** a dialog waiting for an answer waits unseen, and the command looks hung. `quietdesk windows` and `quietdesk shot` show it.
 - **A command on the virtual monitor that nothing can follow:** it does not start, and says so, rather than open on your screen.
@@ -139,6 +144,8 @@ the real screen in every number:
 | A 33-step game test suite | All steps passed from a hidden shell; 16.8 minutes against 16.9 on the real screen |
 | Timers | The same: `Sleep(1)` is a median of 1.50 ms in both places |
 | A command's extra cost | About 30 ms through the shims; about 70 ms through `quietdesk monitor` against 57 ms with no monitor |
+| A hidden test's sound | Muted as soon as it opens its sound, in 10 of 10 runs; looking every 0.2 s instead, it played for 25 to 190 ms |
+| A window that opens on your screen, on the virtual monitor | Off it in about 1 ms (at most 19) when its program is free; as long as the program is busy otherwise |
 | Background cost | The tray app and the keeper about 0.3 % of one core each |
 
 What slows a test run is sharing the GPU with your own game, not the hiding: with a full-screen game using about 78 % of the GPU,

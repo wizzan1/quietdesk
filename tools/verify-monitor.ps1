@@ -2,7 +2,9 @@
 Proves that what runs through `quietdesk monitor` is followed from any shell, against the installed programs and the running keeper: from
 outside any job and from inside a job nothing may leave, as Claude Code's Bash tool runs. A program that places its own window ends up
 on the monitor, also when the command that started it ended at once. Exit codes carry through, the log stays quiet and no file is left.
-When Windows switches the monitor off, as a change of your screens can, it is shown again where it was, with no new plug-in.
+When Windows switches the monitor off, as a change of your screens can, it is shown again where it was, with no new plug-in. A window that
+opens on your screen is off it within a few milliseconds when its program is free; one whose program is busy as it opens stays until the
+program is free again, because Windows lets only a window's own thread move it.
 
 Its windows are fully transparent and take no focus and no input, so nobody sees them even where they must not end up. It needs the
 monitor already plugged in, so that it never plugs one in itself: run it with the mode on. Its last step switches the monitor off once,
@@ -149,6 +151,56 @@ try {
     '--- from inside that job, an exit code'
     $run = Start-InsideJob "`"$quietdesk`" monitor cmd.exe /c `"exit 7`""
     Report 'the exit code carries through' ($run.WaitForExit(30000) -and $run.ExitCode -eq 7) "exit $($run.ExitCode)"
+
+    '--- how long a window that opens on your screen stays there'
+    # The window notes from inside itself, on the system-wide clock, when it was shown and every place it was moved to.
+    $flashScript = Join-Path $here 'flash.ps1'
+    Set-Content -LiteralPath $flashScript -Encoding ascii -Value @'
+param([string]$ResultFile, [int]$Milliseconds, [int]$BusyMilliseconds)
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+using System; using System.Collections.Generic; using System.Diagnostics; using System.Drawing; using System.Runtime.InteropServices; using System.Windows.Forms;
+public class FlashProbe : Form {
+    const int Layered = 0x80000, ClickThrough = 0x20, NoActivate = 0x8000000, ToolWindow = 0x80;
+    [StructLayout(LayoutKind.Sequential)] struct Rect { public int L, T, R, B; }
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out Rect r);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    public List<string> Log = new List<string>();
+    public int Busy;
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams { get { CreateParams p = base.CreateParams; p.ExStyle |= Layered | ClickThrough | NoActivate | ToolWindow; return p; } }
+    public FlashProbe() { FormBorderStyle = FormBorderStyle.None; StartPosition = FormStartPosition.Manual; Location = new Point(100, 100); Size = new Size(300, 200); ShowInTaskbar = false; Opacity = 0; }
+    protected override void WndProc(ref Message m) {
+        base.WndProc(ref m);
+        if (m.Msg == 0x0047 && IsHandleCreated) { Rect r; GetWindowRect(Handle, out r); Log.Add(Stopwatch.GetTimestamp() + " " + r.L + " " + r.T + " " + (IsWindowVisible(Handle) ? 1 : 0)); }
+    }
+    protected override void OnShown(EventArgs e) { base.OnShown(e); if (Busy > 0) System.Threading.Thread.Sleep(Busy); }
+}
+"@
+Add-Type -AssemblyName System.Windows.Forms
+$window = New-Object FlashProbe
+$window.Busy = $BusyMilliseconds
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = $Milliseconds
+$timer.Add_Tick({ $timer.Stop(); $window.Log | Set-Content -LiteralPath $ResultFile; $window.Close() })
+$timer.Start()
+[System.Windows.Forms.Application]::Run($window)
+'@
+    # Visible somewhere off the monitor: from the first such place to the first place on it.
+    function Measure-Flash([int]$Busy) {
+        $result = Join-Path $here "flash-$Busy-$([guid]::NewGuid().ToString('N')).txt"
+        & $quietdesk monitor $ps51 -NoProfile -ExecutionPolicy Bypass -File $flashScript $result ($Busy + 1000) $Busy | Out-Null
+        $places = @(Get-Content -LiteralPath $result -ErrorAction SilentlyContinue | ForEach-Object { $word = $_ -split ' '; [pscustomobject]@{ At = [long]$word[0]; X = [int]$word[1]; Y = [int]$word[2]; Visible = $word[3] -eq '1' } })
+        $onMonitor = { param($place) $place.X -ge $left -and $place.X -lt $right -and $place.Y -ge $top -and $place.Y -lt $bottom }
+        $firstOff = $places | Where-Object { $_.Visible -and -not (& $onMonitor $_) } | Select-Object -First 1
+        $firstOn = $places | Where-Object { & $onMonitor $_ } | Select-Object -First 1
+        if (-not $firstOn) { return 'never' }
+        if (-not $firstOff) { return 0 }
+        return [math]::Round(($firstOn.At - $firstOff.At) * 1000.0 / [Diagnostics.Stopwatch]::Frequency, 1)
+    }
+    $flashes = @(1..5 | ForEach-Object { Measure-Flash 0 })
+    Report 'a window whose program is free leaves your screen within 50 ms' (@($flashes | Where-Object { $_ -isnot [double] -and $_ -isnot [int] -or $_ -gt 50 }).Count -eq 0) "ms on your screen: $($flashes -join ', ')"
+    $busyFlash = Measure-Flash 1000
+    "  a window whose program is busy for 1000 ms as it opens stays on your screen for $busyFlash ms: only its own thread can move it"
 
     '--- what a command costs now, against one with no monitor (medians of 15; no limit: read it)'
     foreach ($word in 'visible', 'monitor') {
