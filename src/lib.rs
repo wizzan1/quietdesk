@@ -881,7 +881,7 @@ impl Picture {
     /// Fully black. An OpenGL window on a hidden desktop captures this way from outside; DirectX and ordinary windows
     /// do not.
     pub fn is_black(&self) -> bool {
-        self.bgra.chunks_exact(4).all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+        self.bgra.as_chunks::<4>().0.iter().all(|&[blue, green, red, _]| blue == 0 && green == 0 && red == 0)
     }
 
     pub fn save_png(&self, path: &Path) -> io::Result<()> {
@@ -890,7 +890,7 @@ impl Picture {
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(io::Error::other)?;
-        let rgb: Vec<u8> = self.bgra.chunks_exact(4).flat_map(|pixel| [pixel[2], pixel[1], pixel[0]]).collect();
+        let rgb: Vec<u8> = self.bgra.as_chunks::<4>().0.iter().flat_map(|&[blue, green, red, _]| [red, green, blue]).collect();
         writer.write_image_data(&rgb).map_err(io::Error::other)?;
         writer.finish().map_err(io::Error::other)
     }
