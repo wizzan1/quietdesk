@@ -1,0 +1,6 @@
+/target
+# Agent sessions working in this folder keep their own settings and notes; none of them belong in the project.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md

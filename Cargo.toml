@@ -1,0 +1,80 @@
+[package]
+name = "quietdesk"
+version = "0.1.0"
+edition = "2024"
+# let chains in `if` and `while`
+rust-version = "1.88"
+description = "Keeps what an AI coding agent's test runs open off your screen on Windows: a hidden desktop, a virtual monitor, muted test sounds."
+license = "MIT"
+repository = "https://github.com/wizzan1/quietdesk"
+
+[lib]
+name = "quietdesk"
+path = "src/lib.rs"
+
+# The real pwsh.exe's stand-in, first on PATH: Claude Code finds PowerShell by name.
+[[bin]]
+name = "pwsh"
+path = "src/bin/pwsh.rs"
+
+# The value of CLAUDE_CODE_SHELL_PREFIX: Claude Code's Bash tool runs through it.
+[[bin]]
+name = "quietdesk-bash"
+path = "src/bin/quietdesk-bash.rs"
+
+# The switch and the see, read and talk commands.
+[[bin]]
+name = "quietdesk"
+path = "src/bin/quietdesk.rs"
+
+# The tray icon and the preview of what runs hidden.
+[[bin]]
+name = "quietdesk-tray"
+path = "src/bin/quietdesk-tray.rs"
+
+# Stands in for the real shell in the tests: reports where it runs and what it received. Never installed.
+[[bin]]
+name = "quietdesk-probe"
+path = "src/bin/quietdesk-probe.rs"
+
+[dependencies]
+png = "0.18"
+# The sound guard's audio interfaces, which windows-sys does not have.
+windows = { version = "0.62", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Kernel",
+    "Win32_System_Diagnostics_Debug",
+    "Wdk_System_Threading",
+    "Win32_System_Environment",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+] }
+
+# These run on every shell command, so start-up time and size come first.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
