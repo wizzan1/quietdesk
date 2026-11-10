@@ -450,27 +450,45 @@ impl Layout {
     }
 
     /// Puts the screen this path shows, the monitor's, at a corner of all the others where the user's mouse cannot cross onto it,
-    /// unless it is at one already. An error when no corner is free, when the monitor is the main screen or none of the others is,
-    /// or when it shows a copy of another screen: a layout like that must never be kept.
-    fn place_at_a_corner(&mut self, path: usize) -> io::Result<()> {
+    /// unless it is at one already. Windows can make the monitor the main screen as the user's screens change, and then the taskbar
+    /// and new windows go where nobody sees them: one of theirs becomes the main screen again first, `main` (the one they had) if
+    /// Windows shows it, else their largest, with their screens around it as they were. True when it had to. An error when the
+    /// monitor shows a copy of another screen, when Windows shows none of theirs, or when no corner is free: a layout like that must
+    /// never be kept.
+    fn place_at_a_corner(&mut self, path: usize, main: Option<&str>) -> io::Result<bool> {
         let source_mode = |path: &DISPLAYCONFIG_PATH_INFO| unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
         let mode = source_mode(&self.paths[path]);
         if self.paths.iter().filter(|other| source_mode(other) == mode).count() > 1 {
             return Err(io::Error::other("the monitor shows a copy of one of your screens"));
         }
         let screens = self.screens();
-        let monitor = screens.iter().find(|(index, _)| *index == mode).map(|(_, bounds)| *bounds);
-        let monitor = monitor.ok_or_else(|| io::Error::other("the monitor has no place among your screens"))?;
+        if !screens.iter().any(|(index, _)| *index == mode) {
+            return Err(io::Error::other("the monitor has no place among your screens"));
+        }
+        let theirs: Vec<(usize, Bounds)> = screens.iter().filter(|(index, _)| *index != mode).copied().collect();
+        let gave_back = !theirs.iter().any(|(_, screen)| (screen.left, screen.top) == (0, 0));
+        if gave_back {
+            let named = main.and_then(|name| self.paths.iter().find(|path| source_name(path).as_deref() == Some(name))).map(source_mode);
+            let area = |screen: &Bounds| i64::from(screen.right - screen.left) * i64::from(screen.bottom - screen.top);
+            // The first of the largest, in Windows' order.
+            let chosen = theirs.iter().find(|(index, _)| Some(*index) == named).or_else(|| theirs.iter().rev().max_by_key(|(_, screen)| area(screen)));
+            let (_, chosen) = *chosen.ok_or_else(|| io::Error::other("Windows shows none of your own screens"))?;
+            // The main screen is the one at 0,0: everything moves by the same step, so theirs stay where they were to each other.
+            for (index, screen) in &screens {
+                self.modes[*index].Anonymous.sourceMode.position = POINTL { x: screen.left - chosen.left, y: screen.top - chosen.top };
+            }
+        }
+        let screens = self.screens();
+        let monitor = screens.iter().find(|(index, _)| *index == mode).map(|(_, bounds)| *bounds).expect("found above");
         let theirs: Vec<Bounds> = screens.iter().filter(|(index, _)| *index != mode).map(|(_, bounds)| *bounds).collect();
-        let main = theirs.iter().find(|screen| (screen.left, screen.top) == (0, 0));
-        let main = *main.ok_or_else(|| io::Error::other("none of your own screens is the main screen"))?;
+        let main = *theirs.iter().find(|screen| (screen.left, screen.top) == (0, 0)).expect("one of theirs is at 0,0 now");
         if apart(&monitor, &theirs) {
-            return Ok(());
+            return Ok(gave_back);
         }
         let (width, height) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
         let (x, y) = free_corner(main, &theirs, width, height).ok_or_else(|| io::Error::other("no corner beside your screens is free"))?;
         self.modes[mode].Anonymous.sourceMode.position = POINTL { x, y };
-        Ok(())
+        Ok(gave_back)
     }
 
     /// Has Windows show exactly this, and keep it as its choice for this set of screens: the next time it sees the same set, it
@@ -514,17 +532,19 @@ fn show_beside(before: &Layout, monitor: &Display) -> io::Result<DISPLAYCONFIG_P
         return Err(io::Error::other("Windows showed none of your own screens"));
     }
     let added = layout.add_from(&now, &monitor_path);
-    layout.place_at_a_corner(added)?;
+    layout.place_at_a_corner(added, None)?;
     layout.apply()?;
     Ok(monitor_path)
 }
 
-/// Puts the monitor back at a corner when a change of the user's screens has moved it beside one of them.
-fn move_to_a_corner(monitor: &Display) -> io::Result<()> {
+/// Puts the monitor back at a corner when a change of the user's screens has moved it beside one of them, or made it the main
+/// screen: then `main`, the user's own main screen, is that again. True when the main screen had to be given back.
+fn move_to_a_corner(monitor: &Display, main: Option<&str>) -> io::Result<bool> {
     let mut layout = Layout::now()?;
     let path = layout.path_of(&text_of(&monitor.name)).ok_or_else(|| io::Error::other("Windows does not show the monitor"))?;
-    layout.place_at_a_corner(path)?;
-    layout.apply()
+    let gave_back = layout.place_at_a_corner(path, main)?;
+    layout.apply()?;
+    Ok(gave_back)
 }
 
 /// Turns the monitor's path on again beside what Windows shows now, after Windows switched it off. Unlike plugging it in anew, this
@@ -1011,6 +1031,9 @@ pub fn keep() -> i32 {
         let mut looks_without_display = 0u32;
         let mut layout_changes: Vec<Instant> = Vec::new();
         let mut corner_problem: Option<String> = None;
+        // The user's own main screen, to give back if Windows makes the monitor the main screen.
+        let main_screen = || active_displays().into_iter().find(|display| display.is_primary && !display.is_virtual).map(|display| text_of(&display.name));
+        let mut main = main_screen();
         loop {
             if loops.is_multiple_of(FAMILY_EVERY_LOOPS) {
                 let in_jobs = commands.processes();
@@ -1026,12 +1049,23 @@ pub fn keep() -> i32 {
                         // A change of the user's screens can put it beside one of them, where the mouse crosses onto it: then it
                         // goes back to a corner. Looked at every time, not only when it moved: Windows may settle the layout only
                         // after a look that found it half way, as when a screen is turned on.
+                        // The user may choose another main screen; one the keeper itself just gave back is not their choice.
+                        if layout_changes.is_empty()
+                            && let Some(theirs) = main_screen()
+                        {
+                            main = Some(theirs);
+                        }
                         if let Some(now) = bounds_of(&display) {
                             let theirs: Vec<Bounds> = active_displays().iter().filter(|d| !d.is_virtual).filter_map(bounds_of).collect();
                             if !apart(&now, &theirs) && layout_changes.len() < LAYOUT_CHANGES {
                                 layout_changes.push(Instant::now());
-                                match move_to_a_corner(&display) {
-                                    Ok(()) => corner_problem = None,
+                                match move_to_a_corner(&display, main.as_deref()) {
+                                    Ok(gave_back) => {
+                                        if gave_back {
+                                            note_problem("Windows made the virtual monitor your main screen, with the taskbar where nobody sees it; one of your own screens is the main screen again");
+                                        }
+                                        corner_problem = None;
+                                    }
                                     // Noted once, not at every try.
                                     Err(error) if corner_problem.as_deref() != Some(error.to_string().as_str()) => {
                                         note_problem(&format!("the virtual monitor is beside one of your screens, and it could not go to a corner yet: {error}"));
@@ -1399,13 +1433,13 @@ mod tests {
         let mut layout = Layout { paths: vec![path_on(0), path_on(1), path_on(2)], modes: vec![main, right, screen_at(2560, 1080, 2560, 1440)] };
         let theirs = [Bounds { left: 0, top: 0, right: 2560, bottom: 1440 }, Bounds { left: 2560, top: 0, right: 4480, bottom: 1080 }];
         assert!(!apart(&layout.screens()[2].1, &theirs), "the test must start with the monitor where the mouse reaches it");
-        layout.place_at_a_corner(2).unwrap();
+        assert!(!layout.place_at_a_corner(2, None).unwrap(), "their main screen was there, and nothing needed giving back");
         let screens = layout.screens();
         assert_eq!([screens[0].1, screens[1].1], theirs, "the user's own screens moved");
         let monitor = screens[2].1;
         assert!(apart(&monitor, &theirs), "the monitor is still where the mouse reaches it: {monitor:?}");
         assert_eq!((monitor.right - monitor.left, monitor.bottom - monitor.top), (2560, 1440), "the monitor changed size");
-        layout.place_at_a_corner(2).unwrap();
+        layout.place_at_a_corner(2, None).unwrap();
         assert_eq!(layout.screens()[2].1, monitor, "a monitor at a corner already was moved");
 
         // An earlier keeper's monitor, still listed, goes; two screens showing one picture still share it.
@@ -1421,13 +1455,40 @@ mod tests {
         assert_eq!(source(&kept.paths[0]), source(&kept.paths[1]), "the copy no longer shares its picture");
         assert_eq!(kept.screens()[0].1, theirs[0]);
 
-        // None of theirs is the main screen at 0,0: the monitor is.
-        let mut monitor_is_main = Layout { paths: vec![path_on(0), path_on(1)], modes: vec![screen_at(-2560, 0, 2560, 1440), screen_at(0, 0, 2560, 1440)] };
-        assert!(monitor_is_main.place_at_a_corner(1).is_err(), "a layout with the monitor as the main screen was accepted");
         // The monitor shows a copy of their screen: moving it would move theirs.
         let mut copy = Layout { paths: vec![path_on(0), path_on(0)], modes: vec![main] };
-        assert!(copy.place_at_a_corner(1).is_err(), "a monitor that copies the user's screen was accepted");
+        assert!(copy.place_at_a_corner(1, None).is_err(), "a monitor that copies the user's screen was accepted");
         assert_eq!(copy.screens()[0].1, theirs[0], "the user's screen moved");
+    }
+
+    /// Windows made the monitor the main screen, at 0,0, as it did twice when the user's screens changed: the taskbar and new windows
+    /// went where nobody sees them. Their largest screen is the main screen again, their screens keep their places to each other, and
+    /// the monitor goes to a corner. Never a layout with the monitor as the main screen.
+    #[test]
+    fn a_monitor_made_the_main_screen_gives_it_back() {
+        // The monitor at 0,0; theirs: a 2560x1440 to its right, and a 1920x1080 above-left of that one.
+        let mut layout = Layout {
+            paths: vec![path_on(0), path_on(1), path_on(2)],
+            modes: vec![screen_at(0, 0, 2560, 1440), screen_at(2560, 0, 2560, 1440), screen_at(640, -1080, 1920, 1080)],
+        };
+        assert!(layout.place_at_a_corner(0, None).unwrap(), "the main screen had to be given back");
+        let screens = layout.screens();
+        let (monitor, big, small) = (screens[0].1, screens[1].1, screens[2].1);
+        assert_eq!(big, Bounds { left: 0, top: 0, right: 2560, bottom: 1440 }, "their largest screen is not the main screen");
+        assert_eq!((small.left - big.left, small.top - big.top), (640 - 2560, -1080), "their screens moved apart from each other");
+        assert_ne!((monitor.left, monitor.top), (0, 0), "the monitor is still the main screen");
+        assert!(apart(&monitor, &[big, small]), "the monitor is where the mouse reaches it: {monitor:?}");
+        assert_eq!((monitor.right - monitor.left, monitor.bottom - monitor.top), (2560, 1440), "the monitor changed size");
+
+        // With only one of theirs, left of the monitor: that one.
+        let mut alone = Layout { paths: vec![path_on(0), path_on(1)], modes: vec![screen_at(-2560, 0, 2560, 1440), screen_at(0, 0, 2560, 1440)] };
+        assert!(alone.place_at_a_corner(1, None).unwrap());
+        let screens = alone.screens();
+        assert_eq!(screens[0].1, Bounds { left: 0, top: 0, right: 2560, bottom: 1440 });
+        assert!(apart(&screens[1].1, &[screens[0].1]));
+        // None of theirs at all: nothing to give it to.
+        let mut only_the_monitor = Layout { paths: vec![path_on(0)], modes: vec![screen_at(0, 0, 2560, 1440)] };
+        assert!(only_the_monitor.place_at_a_corner(0, None).is_err(), "a layout with no screen of theirs was accepted");
     }
 
     /// How long the test's children live, in pings a second apart: long enough to be seen, gone soon after a test, as killing
