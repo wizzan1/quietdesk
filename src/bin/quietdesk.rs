@@ -169,6 +169,15 @@ fn status() -> i32 {
     say!("{}", mode_line(read_mode()));
     say!("{}", sound_line());
     say!("This shell runs on desktop: {}", quietdesk::current_desktop_name().unwrap_or_else(|e| e.to_string()));
+    // Per shell: a packaged app's commands, such as the Claude app's, see a copy of the console setting of their own.
+    match (quietdesk::new_consoles_stay_with_their_command(), read_mode()) {
+        (Ok(true), _) => say!("New consoles from this shell: the classic console, which stays with a hidden command"),
+        (Ok(false), Mode::On) => say!(
+            "New consoles from this shell: Windows Terminal, ON YOUR SCREEN even from a hidden command. The next command through QuietDesk sets it; `quietdesk on` does it now."
+        ),
+        (Ok(false), Mode::Off) => say!("New consoles from this shell: your own choice"),
+        (Err(error), _) => say!("New consoles from this shell: the setting could not be read: {error}"),
+    }
     if std::env::var_os(quietdesk::CLAUDE_VAR).is_some() {
         let own_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
         let powershell = own_dir.is_some_and(|dir| quietdesk::pwsh_shim_connected(&dir));

@@ -86,6 +86,15 @@ Run these one at a time, each as its own tool call, exactly as written, without 
 10. PowerShell: Write-Output marker-ps-out; exit 9
 "@
 
+# This process's copy of the console setting as it was, backup included: it must be exactly so again at the end.
+function Get-ConsoleSetting {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Console\%%Startup')
+    $before = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Console\%%Startup\QuietDeskBefore')
+    $values = if ($key) { @($key.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($key.GetValue($_))" }) } else { @() }
+    return "$($values -join '; ') | backup: $([bool]$before)"
+}
+$consoleAtStart = Get-ConsoleSetting
+
 Write-Host '--- the mode off: the baseline'
 & $quietdesk off | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "quietdesk off failed with exit code $LASTEXITCODE." }
@@ -194,7 +203,8 @@ finally {
     & $quietdesk off | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Warning 'quietdesk off failed: check the console setting with quietdesk status.' }
 }
-Test-That 'the console setting came back' (-not (Test-Path -LiteralPath (Join-Path $work 'console-before')))
+$consoleAtEnd = Get-ConsoleSetting
+Test-That 'the console setting came back' ($consoleAtEnd -eq $consoleAtStart) "before: $consoleAtStart; after: $consoleAtEnd"
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 if ($failures.Count) {

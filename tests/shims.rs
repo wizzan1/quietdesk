@@ -18,11 +18,13 @@ const REAL: &str = "desktop=Default";
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
-/// A throwaway install: the shim in one folder, a probe as the "real" pwsh in the next one on PATH, and its own mode file.
+/// A throwaway install: the shim in one folder, a probe as the "real" pwsh in the next one on PATH, its own mode file, and its own
+/// copy of the console setting: the shims set it on every command, and a test must never touch the user's.
 struct Setup {
     root: PathBuf,
     shim: PathBuf,
     path: String,
+    console_key: String,
 }
 
 impl Setup {
@@ -36,7 +38,8 @@ impl Setup {
         std::fs::copy(PROBE, real_dir.join("pwsh.exe")).unwrap();
         let system = PathBuf::from(std::env::var("SystemRoot").unwrap());
         let path = format!("{};{};{};{}", shim_dir.display(), real_dir.display(), system.join("System32").display(), system.display());
-        Self { root, shim, path }
+        let console_key = format!(r"Software\QuietDeskTest\{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst));
+        Self { root, shim, path, console_key }
     }
 
     fn mode(&self, word: &str) {
@@ -50,6 +53,7 @@ impl Setup {
         let mut command = Command::new(PROBE);
         command.arg(program).env("QUIETDESK_PROBE_LAUNCH", "1");
         command.env("QUIETDESK_DIR", &self.root).env("PATH", &self.path).env("CLAUDECODE", "1").env_remove("QUIETDESK_DECIDED").env_remove("QUIETDESK_SHIM_DIRS");
+        command.env("QUIETDESK_CONSOLE_KEY", &self.console_key);
         command
     }
 
@@ -65,6 +69,7 @@ impl Setup {
 impl Drop for Setup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = Command::new("reg").args(["delete", &format!(r"HKCU\{}", self.console_key), "/f"]).output();
     }
 }
 
@@ -440,7 +445,7 @@ fn registry_value(key: &str, name: &str) -> Option<String> {
 #[test]
 fn the_switch_keeps_the_users_console_choice_and_gives_it_back() {
     let setup = Setup::new();
-    let key = format!(r"Software\QuietDeskTest\{}", std::process::id());
+    let key = setup.console_key.clone();
     let conhost = "{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}";
     let terminal = "{USERS-OWN-CHOICE}";
     let status = Command::new("reg").args(["add", &format!(r"HKCU\{key}"), "/v", "DelegationTerminal", "/d", terminal, "/f"]).output().unwrap().status;
@@ -460,8 +465,42 @@ fn the_switch_keeps_the_users_console_choice_and_gives_it_back() {
     assert_eq!(registry_value(&key, "DelegationTerminal").as_deref(), Some(terminal));
     assert_eq!(registry_value(&key, "DelegationConsole"), None, "a value that was not there is removed again");
     assert_eq!(std::fs::read_to_string(setup.root.join("mode")).unwrap().trim(), "off");
+    assert!(!registry_key_exists(&format!(r"{key}\QuietDeskBefore")), "the backup stayed behind");
+}
 
-    let _ = Command::new("reg").args(["delete", r"HKCU\Software\QuietDeskTest", "/f"]).output();
+fn registry_key_exists(key: &str) -> bool {
+    Command::new("reg").args(["query", &format!(r"HKCU\{key}")]).output().unwrap().status.success()
+}
+
+/// The Claude app is a packaged app: Windows gives what it starts a copy of the console setting of its own, and the new consoles of
+/// those commands follow that copy. The switch set only the copy it ran in, so with the mode on, a test's new console from the Bash
+/// tool handed over to Windows Terminal, on the owner's screen during their game. Here a copy the switch never touched holds the
+/// user's own Windows Terminal: the next command's shim sets the classic console in it, and with the mode off gives theirs back.
+#[test]
+fn a_copy_of_the_console_setting_the_switch_never_saw_follows_the_mode_from_the_next_command() {
+    let setup = Setup::new();
+    let (conhost, terminal) = ("{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}", "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}");
+    let key = setup.console_key.clone();
+    for name in ["DelegationConsole", "DelegationTerminal"] {
+        assert!(Command::new("reg").args(["add", &format!(r"HKCU\{key}"), "/v", name, "/d", terminal, "/f"]).output().unwrap().status.success());
+    }
+    // As the switch does where it runs, but nowhere near this copy: only the mode file says on.
+    setup.mode("on");
+    let output = setup.command(&setup.shim).output().unwrap();
+    assert_eq!(line(&text(&output), "desktop="), HIDDEN);
+    assert_eq!(registry_value(&key, "DelegationConsole").as_deref(), Some(conhost), "the command's copy still hands new consoles to the Terminal");
+    assert_eq!(registry_value(&key, "DelegationTerminal").as_deref(), Some(conhost));
+    assert_eq!(registry_value(&format!(r"{key}\QuietDeskBefore"), "DelegationConsole").as_deref(), Some(terminal), "the user's choice was not kept");
+    // A second command finds it set, and keeps the user's choice as it was.
+    setup.command(&setup.shim).output().unwrap();
+    assert_eq!(registry_value(&format!(r"{key}\QuietDeskBefore"), "DelegationTerminal").as_deref(), Some(terminal), "the backup was overwritten");
+
+    setup.mode("off");
+    let output = setup.command(&setup.shim).output().unwrap();
+    assert_eq!(line(&text(&output), "desktop="), REAL);
+    assert_eq!(registry_value(&key, "DelegationConsole").as_deref(), Some(terminal), "the user's own choice did not come back");
+    assert_eq!(registry_value(&key, "DelegationTerminal").as_deref(), Some(terminal));
+    assert!(!registry_key_exists(&format!(r"{key}\QuietDeskBefore")), "the backup stayed behind");
 }
 
 const TEST_APP: &str = r#"

@@ -172,7 +172,9 @@ quietdesk mute on | off                 whether what runs out of sight is kept s
 matches your own windows on the real screen.
 
 While the mode is on, new console windows, including your own, open in the classic console instead of Windows Terminal: a hidden
-one would otherwise hand over to Windows Terminal and reach your screen. Turning it off restores your setting.
+one would otherwise hand over to Windows Terminal and reach your screen. Turning it off restores your setting. The Claude app is a
+packaged app, and Windows gives what it runs a copy of this setting of its own, so every command through QuietDesk also puts its
+own copy right; `quietdesk status` says where a new console from that shell would open.
 
 ## Checks
 

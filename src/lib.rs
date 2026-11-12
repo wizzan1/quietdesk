@@ -26,7 +26,8 @@ use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Diagnostics::Debug::{GetErrorMode, ReadProcessMemory, SEM_FAILCRITICALERRORS, SetErrorMode};
 use windows_sys::Win32::System::Environment::GetCommandLineW;
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteKeyW, RegGetValueW, RegOpenKeyExW,
     RegSetKeyValueW,
 };
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -62,6 +63,12 @@ const CONSOLE_VALUES: [&str; 2] = ["DelegationConsole", "DelegationTerminal"];
 /// Windows Console Host. A new console from a hidden command otherwise hands over to Windows Terminal, which opens on
 /// the user's screen.
 const CONHOST_GUID: &str = "{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}";
+/// The user's own choice, kept beside it in the same key. Windows gives a packaged app, such as the Claude app, a copy of this key
+/// of its own: what that app starts, and the new consoles of what it starts, see the copy. So each copy needs the setting, and
+/// keeps its own backup.
+const CONSOLE_BEFORE: &str = "QuietDeskBefore";
+/// Written last into the backup, so a backup cut short is never taken for the user's choice.
+const CONSOLE_BEFORE_DONE: &str = "Saved";
 
 /// A virus scanner can hold the mode file for a moment.
 const MODE_READ_TRIES: u32 = 5;
@@ -146,14 +153,14 @@ pub fn set_mode(mode: Mode) -> io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     match mode {
         Mode::On => {
-            send_new_consoles_to_conhost(&dir)?;
+            keep_new_consoles_with(Mode::On)?;
             write_mode_file(&dir, "on\n")?;
             monitor::stay_plugged_in_while_the_mode_is_on();
             Ok(())
         }
         Mode::Off => {
             write_mode_file(&dir, "off\n")?;
-            restore_new_consoles(&dir)
+            keep_new_consoles_with(Mode::Off)
         }
     }
 }
@@ -170,26 +177,39 @@ fn replace_file(path: &Path, text: &str) -> io::Result<()> {
     std::fs::rename(&aside, path)
 }
 
-/// As `replace_file`, but a file already there stays as it is: a link to the new one is made in one step, and that fails if the
-/// name is taken.
-fn create_file_once(path: &Path, text: &str) -> io::Result<()> {
-    let aside = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&aside, text)?;
-    let linked = std::fs::hard_link(&aside, path);
-    let _ = std::fs::remove_file(&aside);
-    match linked {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        other => other,
-    }
-}
-
 /// `QUIETDESK_CONSOLE_KEY` lets the tests use a key of their own: they must never touch the user's console choice.
 fn console_key() -> String {
     std::env::var("QUIETDESK_CONSOLE_KEY").unwrap_or_else(|_| CONSOLE_KEY.to_string())
 }
 
 fn read_console_value(name: &str) -> io::Result<Option<String>> {
+    read_value_in(&console_key(), name)
+}
+
+fn write_console_value(name: &str, text: &str) -> io::Result<()> {
+    write_value_in(&console_key(), name, text)
+}
+
+fn delete_console_value(name: &str) -> io::Result<()> {
     let (key, value) = (wide(console_key()), wide(name));
+    let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
+    match status {
+        0 | ERROR_FILE_NOT_FOUND => Ok(()),
+        other => Err(io::Error::from_raw_os_error(other as i32)),
+    }
+}
+
+/// Where an earlier version kept the backup, in a file: one copy of the setting only, and not always the one that matters.
+fn legacy_console_backup(dir: &Path) -> PathBuf {
+    dir.join("console-before")
+}
+
+fn backup_key() -> String {
+    format!(r"{}\{CONSOLE_BEFORE}", console_key())
+}
+
+fn read_value_in(key: &str, name: &str) -> io::Result<Option<String>> {
+    let (key, value) = (wide(key), wide(name));
     let mut buffer = [0u16; TEXT_BUFFER];
     let mut bytes = (buffer.len() * 2) as u32;
     let status = unsafe {
@@ -202,66 +222,122 @@ fn read_console_value(name: &str) -> io::Result<Option<String>> {
     }
 }
 
-fn write_console_value(name: &str, text: &str) -> io::Result<()> {
-    let (key, value, data) = (wide(console_key()), wide(name), wide(text));
+fn write_value_in(key: &str, name: &str, text: &str) -> io::Result<()> {
+    let (key, value, data) = (wide(key), wide(name), wide(text));
     let status = unsafe {
         RegSetKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32)
     };
     if status == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(status as i32)) }
 }
 
-fn delete_console_value(name: &str) -> io::Result<()> {
-    let (key, value) = (wide(console_key()), wide(name));
-    let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) };
-    match status {
+fn backup_exists() -> bool {
+    let key = wide(backup_key());
+    let mut handle: HKEY = null_mut();
+    let found = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_READ, &mut handle) } == 0;
+    if found {
+        unsafe { RegCloseKey(handle) };
+    }
+    found
+}
+
+/// Creates the backup key, or says it was there: one step, so of two commands at once only one takes the backup.
+fn create_backup_key() -> io::Result<bool> {
+    let key = wide(backup_key());
+    let (mut handle, mut disposition): (HKEY, u32) = (null_mut(), 0);
+    let status = unsafe {
+        RegCreateKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, null(), REG_OPTION_NON_VOLATILE, KEY_WRITE, null(), &mut handle, &mut disposition)
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    unsafe { RegCloseKey(handle) };
+    Ok(disposition == REG_CREATED_NEW_KEY)
+}
+
+fn delete_backup_key() -> io::Result<()> {
+    let key = wide(backup_key());
+    match unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, key.as_ptr()) } {
         0 | ERROR_FILE_NOT_FOUND => Ok(()),
         other => Err(io::Error::from_raw_os_error(other as i32)),
     }
 }
 
-fn console_backup(dir: &Path) -> PathBuf {
-    dir.join("console-before")
-}
-
-/// Remembers the user's choice once, so turning on twice cannot overwrite it with our own value.
+/// New consoles in this process's copy of the setting open in the classic console, which stays with a hidden command. The user's
+/// choice is backed up first, once per copy, so turning on twice cannot overwrite it with our own value.
 fn send_new_consoles_to_conhost(dir: &Path) -> io::Result<()> {
-    let backup = console_backup(dir);
-    if !backup.exists() {
-        let mut saved = String::new();
-        for name in CONSOLE_VALUES {
-            saved.push_str(&read_console_value(name)?.unwrap_or_default());
-            saved.push('\n');
+    let now: Vec<Option<String>> = CONSOLE_VALUES.iter().map(|name| read_console_value(name)).collect::<io::Result<_>>()?;
+    if now.iter().all(|value| value.as_deref() == Some(CONHOST_GUID)) {
+        return Ok(());
+    }
+    // Read before the backup is claimed: of two commands at once, the one that claims it has read the user's own values.
+    if create_backup_key()? {
+        for (name, value) in CONSOLE_VALUES.iter().zip(&now) {
+            if let Some(value) = value {
+                write_value_in(&backup_key(), name, value)?;
+            }
         }
-        // Two switches at once both find no backup, and the later one may read what the earlier one set: the first backup is the
-        // user's, and stays.
-        create_file_once(&backup, &saved)?;
+        write_value_in(&backup_key(), CONSOLE_BEFORE_DONE, "1")?;
     }
     for name in CONSOLE_VALUES {
         write_console_value(name, CONHOST_GUID)?;
     }
+    // The earlier version's backup is now this copy's, taken above.
+    let _ = std::fs::remove_file(legacy_console_backup(dir));
     Ok(())
 }
 
+/// Gives this process's copy of the setting back what it held before the mode was on. A value that is no longer ours is a choice the
+/// user made meanwhile: theirs stays.
 fn restore_new_consoles(dir: &Path) -> io::Result<()> {
-    let backup = console_backup(dir);
-    let saved = match std::fs::read_to_string(&backup) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let mut lines = saved.lines();
-    for name in CONSOLE_VALUES {
-        let before = lines.next().unwrap_or("");
-        // A value that is no longer ours is a choice the user made while the mode was on: theirs stays.
-        if read_console_value(name)?.as_deref() != Some(CONHOST_GUID) {
-            continue;
+    let legacy = legacy_console_backup(dir);
+    if !backup_exists() {
+        // Only an earlier version's backup: restored as that version did.
+        let saved = match std::fs::read_to_string(&legacy) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut lines = saved.lines();
+        for name in CONSOLE_VALUES {
+            let before = lines.next().unwrap_or("");
+            if read_console_value(name)?.as_deref() == Some(CONHOST_GUID) {
+                match before {
+                    "" => delete_console_value(name)?,
+                    value => write_console_value(name, value)?,
+                }
+            }
         }
-        match before {
-            "" => delete_console_value(name)?,
-            value => write_console_value(name, value)?,
+        return std::fs::remove_file(legacy);
+    }
+    // A backup cut short says nothing of the user's choice: then ours stays, the safe side.
+    if read_value_in(&backup_key(), CONSOLE_BEFORE_DONE)?.is_some() {
+        for name in CONSOLE_VALUES {
+            if read_console_value(name)?.as_deref() != Some(CONHOST_GUID) {
+                continue;
+            }
+            match read_value_in(&backup_key(), name)? {
+                Some(value) => write_console_value(name, &value)?,
+                None => delete_console_value(name)?,
+            }
         }
     }
-    std::fs::remove_file(backup)
+    delete_backup_key()
+}
+
+/// Puts this process's copy of the console setting where the mode wants it. The switch does it where it runs, and every command's
+/// first shim where that command runs: a packaged app's commands, such as the Claude app's, see a copy of their own.
+pub fn keep_new_consoles_with(mode: Mode) -> io::Result<()> {
+    match mode {
+        Mode::On => send_new_consoles_to_conhost(&state_dir()),
+        Mode::Off if backup_exists() || legacy_console_backup(&state_dir()).exists() => restore_new_consoles(&state_dir()),
+        Mode::Off => Ok(()),
+    }
+}
+
+/// Where a new console from this process opens, by its copy of the setting: the classic console stays with a hidden command,
+/// anything else (Windows Terminal, or Windows deciding, which is Windows Terminal on Windows 11) opens on the user's screen.
+pub fn new_consoles_stay_with_their_command() -> io::Result<bool> {
+    Ok(read_console_value("DelegationConsole")?.as_deref() == Some(CONHOST_GUID))
 }
 
 /// A desktop handle; the hidden desktop exists for as long as a handle or a process holds it.
@@ -325,7 +401,11 @@ pub fn decide_place(require_claude: bool) -> Place {
         return Place::Inherit;
     }
     mark_decided();
-    match read_mode() {
+    let mode = read_mode();
+    if let Err(error) = keep_new_consoles_with(mode) {
+        note_problem(&format!("could not set where new consoles open, for this command's copy of the setting: {error}"));
+    }
+    match mode {
         Mode::On => Place::Hidden,
         Mode::Off => Place::Inherit,
     }
@@ -992,21 +1072,6 @@ mod tests {
         let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(dir.join("mode")).unwrap();
         assert!(mode_in(&dir).is_err(), "a file someone holds says nothing");
         drop(held);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Two `quietdesk on` at once: the later one can read the console choice the earlier one already changed. Its backup must not
-    /// replace the first, which holds the user's own choice.
-    #[test]
-    fn a_backup_is_written_once_and_never_over_the_first() {
-        let dir = std::env::temp_dir().join(format!("quietdesk-backup-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let backup = dir.join("backup");
-        create_file_once(&backup, "the user's own\n").unwrap();
-        create_file_once(&backup, "what the first switch set\n").unwrap();
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "the user's own\n", "the first backup was replaced");
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|entry| entry.file_name()).collect();
-        assert_eq!(left, [OsString::from("backup")], "a file written aside was left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
