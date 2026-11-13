@@ -393,7 +393,78 @@ pub enum Place {
 
 /// Where a command Claude Code starts belongs. Only the first shim of a run decides; `require_claude` keeps the user's
 /// own `pwsh` out of it, because the pwsh shim is on the user's PATH.
+/// Programs the user wants on their screen even while the mode is on: things to look at, not tests, such as Blender. One program
+/// file name a line, as `quietdesk exclude` keeps them.
+fn excluded_file() -> PathBuf {
+    state_dir().join("always-on-your-screen")
+}
+
+/// A program's file name as the list keeps it: the last part of a path, in lower case, with ".exe" when it has no extension. None
+/// for nothing at all.
+pub fn program_name(given: &str) -> Option<String> {
+    let name = given.trim().trim_matches(|c| c == '"' || c == '\'').rsplit(['/', '\\']).next()?.trim().to_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    Some(if Path::new(&name).extension().is_some() { name } else { format!("{name}.exe") })
+}
+
+/// The programs on the list, as kept.
+pub fn excluded_programs() -> Vec<String> {
+    std::fs::read_to_string(excluded_file()).unwrap_or_default().lines().filter_map(program_name).collect()
+}
+
+/// Puts a program on the list or takes it off; its name as kept, and whether the list changed.
+pub fn set_excluded(given: &str, excluded: bool) -> io::Result<(String, bool)> {
+    let name = program_name(given).ok_or_else(|| io::Error::other("no program named"))?;
+    let mut programs = excluded_programs();
+    let had = programs.contains(&name);
+    if excluded == had {
+        return Ok((name, false));
+    }
+    if excluded {
+        programs.push(name.clone());
+        programs.sort();
+    } else {
+        programs.retain(|program| program != &name);
+    }
+    std::fs::create_dir_all(state_dir())?;
+    replace_file(&excluded_file(), &programs.iter().map(|program| format!("{program}\n")).collect::<String>())?;
+    Ok((name, true))
+}
+
+/// Whether a command names one of these programs: a word of it, or the last part of a path in it, is that program's file name,
+/// with or without ".exe". `blender.exe file.blend`, `& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe"` and
+/// `blender --python x.py` name blender.exe; a folder called BlenderProject does not.
+pub fn names_a_program(command: &str, programs: &[String]) -> bool {
+    if programs.is_empty() {
+        return false;
+    }
+    let bare = |name: &str| name.strip_suffix(".exe").unwrap_or(name).to_string();
+    let wanted: Vec<String> = programs.iter().map(|program| bare(program)).collect();
+    // Paths may hold spaces, so a word is cut at what ends a path only after its last separator.
+    command
+        .split(['"', '\'', '`', ';', '&', '|', '(', ')', '<', '>', '\n', '\r', '\t'])
+        .flat_map(|piece| {
+            let tail = piece.rsplit(['/', '\\']).next().unwrap_or(piece);
+            tail.split_whitespace().take(1).chain(piece.split_whitespace()).map(str::to_string).collect::<Vec<_>>()
+        })
+        .map(|word| bare(&word.rsplit(['/', '\\']).next().unwrap_or(&word).to_lowercase()))
+        .any(|word| wanted.contains(&word))
+}
+
+/// Whether a command names a program on the user's list.
+pub fn names_an_excluded_program(command: &str) -> bool {
+    names_a_program(command, &excluded_programs())
+}
+
 pub fn decide_place(require_claude: bool) -> Place {
+    decide_place_for(require_claude, "")
+}
+
+/// Where a command Claude Code starts belongs, by its own text: a command that names a program on the user's list runs on their
+/// screen even while the mode is on, as a whole.
+pub fn decide_place_for(require_claude: bool, command: &str) -> Place {
     if std::env::var_os(DECIDED_VAR).is_some() {
         return Place::Inherit;
     }
@@ -406,6 +477,7 @@ pub fn decide_place(require_claude: bool) -> Place {
         note_problem(&format!("could not set where new consoles open, for this command's copy of the setting: {error}"));
     }
     match mode {
+        Mode::On if names_an_excluded_program(command) => Place::Real,
         Mode::On => Place::Hidden,
         Mode::Off => Place::Inherit,
     }
@@ -1095,6 +1167,41 @@ mod tests {
         let text = String::from_utf16_lossy(&block);
         let names: Vec<&str> = text.split('\0').collect();
         assert!(names.contains(&"QUIETDESK_TEST_GIVEN=a value with = and ü"), "{names:?}");
+    }
+
+    #[test]
+    fn a_program_is_kept_by_its_file_name() {
+        assert_eq!(program_name("blender").as_deref(), Some("blender.exe"));
+        assert_eq!(program_name(" Blender.EXE ").as_deref(), Some("blender.exe"));
+        assert_eq!(program_name(r#""C:\Program Files\Blender Foundation\Blender 5.2\blender.exe""#).as_deref(), Some("blender.exe"));
+        assert_eq!(program_name("/c/tools/godot.cmd").as_deref(), Some("godot.cmd"));
+        assert_eq!(program_name("  "), None);
+    }
+
+    /// The commands sessions really write, from Bash and from PowerShell, and the ones that only mention a similar name.
+    #[test]
+    fn a_command_names_a_program_by_its_word_or_the_end_of_its_path() {
+        let list = vec!["blender.exe".to_string()];
+        for named in [
+            "blender.exe file.blend --python x.py",
+            "blender --factory-startup &",
+            r#"& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" C:\x\a.blend"#,
+            "'/c/Program Files/Blender Foundation/Blender 5.2/blender.exe' -b a.blend",
+            "Start-Process -FilePath 'C:/Program Files/Blender Foundation/Blender 5.2/blender.exe'",
+            "cd x; BLENDER a.blend",
+        ] {
+            assert!(names_a_program(named, &list), "missed: {named}");
+        }
+        for not_named in [
+            "cd C:\\Users\\x\\BlenderProject && cargo test",
+            "python blender_export.py",
+            "echo blenderish",
+            "ls /c/tools/blender-addons",
+            "uvx blender-mcp",
+        ] {
+            assert!(!names_a_program(not_named, &list), "named by mistake: {not_named}");
+        }
+        assert!(!names_a_program("blender.exe a.blend", &[]), "an empty list names nothing");
     }
 
     fn utf16(text: &str) -> Vec<u16> {

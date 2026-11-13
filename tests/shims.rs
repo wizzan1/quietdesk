@@ -381,6 +381,40 @@ fn bash_scripts_run_hidden_with_the_mode_on_and_in_place_with_it_off() {
     assert_eq!(format!("desktop={}", as_claude_code_runs(&setup, &script)[1].out.trim_end()), REAL);
 }
 
+/// A program on the user's list opens on their screen even with the mode on: a Bash command that names it runs there as a whole,
+/// while every other command stays hidden; off the list, it is hidden again.
+#[test]
+fn a_command_that_names_a_listed_program_runs_on_the_real_screen() {
+    let setup = Setup::new();
+    let quietdesk = |words: &[&str]| setup.command(Path::new(QUIETDESK)).args(words).output().unwrap();
+    setup.mode("on");
+    let names_the_probe = format!("'{}' x", PROBE.replace('\\', "/"));
+    let other = format!("'{}' desktop", QUIETDESK.replace('\\', "/"));
+    assert_eq!(line(&as_claude_code_runs(&setup, &names_the_probe)[1].out, "desktop="), HIDDEN, "hidden before it is on the list");
+
+    let added = quietdesk(&["exclude", "add", r"C:\anywhere\QuietDesk-Probe"]);
+    assert!(text(&added).contains("quietdesk-probe.exe now opens on your screen"), "{}", text(&added));
+    assert!(text(&quietdesk(&["exclude", "list"])).contains("quietdesk-probe.exe"));
+    assert_eq!(line(&as_claude_code_runs(&setup, &names_the_probe)[1].out, "desktop="), REAL, "a listed program stayed hidden");
+    assert_eq!(as_claude_code_runs(&setup, &other)[1].out, "QuietDesk\n", "a command that names nothing on the list left the hidden desktop");
+
+    assert!(text(&quietdesk(&["exclude", "remove", "quietdesk-probe"])).contains("runs hidden again"));
+    assert_eq!(line(&as_claude_code_runs(&setup, &names_the_probe)[1].out, "desktop="), HIDDEN, "still on the screen after it left the list");
+}
+
+/// The PowerShell tool hands its command over in CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT: a listed program named there takes the command
+/// to the real screen too.
+#[test]
+fn the_powershell_tool_s_command_that_names_a_listed_program_runs_on_the_real_screen() {
+    let setup = Setup::new();
+    setup.mode("on");
+    assert!(setup.command(Path::new(QUIETDESK)).args(["exclude", "add", "blender"]).output().unwrap().status.success());
+    let run = |script: &str| text(&setup.command(&setup.shim).env("CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT", script).output().unwrap());
+    let blender = r#"& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" C:\work\scene.blend"#;
+    assert_eq!(line(&run(blender), "desktop="), REAL, "the PowerShell tool's Blender stayed hidden");
+    assert_eq!(line(&run(r"cd C:\work\BlenderProject; cargo test"), "desktop="), HIDDEN, "a folder's name took a test to the screen");
+}
+
 /// Claude Code starts an MCP server through the prefix itself, with the command and arguments as one line of shell words: this is
 /// the line Claude Code 2.1.317 really made (captured). The server must get each argument exactly; through bash, `/c` became `C:/`.
 #[test]

@@ -33,6 +33,10 @@ quietdesk desktop
     Prints the desktop this shell runs on.
 quietdesk start-tray | quit-tray
     Starts the tray icon on your screen, or asks it to close. Install and uninstall do this.
+quietdesk exclude add | remove <program>
+quietdesk exclude list
+    Programs that open on your screen even while the mode is on, such as Blender: a command that names one runs on your screen,
+    and while the mode is on, their windows that open on the virtual monitor, or minimized, come to your main screen.
 
 Windows, wherever they run. <window> is 0xHANDLE, a process id, or part of the title, class or
 program name of a window out of sight (a name never matches your own windows on the real screen):
@@ -77,6 +81,12 @@ fn main() {
         ["close", window] => report(close(window)),
         ["quit-tray"] => report(quit_tray()),
         ["start-tray"] => report(start_tray()),
+        ["exclude", "add", program] => report(exclude(program, true)),
+        ["exclude", "remove", program] => report(exclude(program, false)),
+        ["exclude", "list"] => {
+            say!("{}", excluded_line());
+            0
+        }
         _ => {
             eprintln!("{USAGE}");
             USAGE_ERROR
@@ -147,6 +157,28 @@ fn quit_tray() -> Result<(), String> {
     }
 }
 
+fn exclude(program: &str, excluded: bool) -> Result<(), String> {
+    let (name, changed) = quietdesk::set_excluded(program, excluded).map_err(|error| format!("could not change the list: {error}"))?;
+    say!(
+        "{}",
+        match (excluded, changed) {
+            (true, true) => format!("{name} now opens on your screen even while the mode is on."),
+            (true, false) => format!("{name} was already on the list."),
+            (false, true) => format!("{name} runs hidden again while the mode is on."),
+            (false, false) => format!("{name} was not on the list."),
+        }
+    );
+    say!("{}", excluded_line());
+    Ok(())
+}
+
+fn excluded_line() -> String {
+    match quietdesk::excluded_programs().as_slice() {
+        [] => "On your screen even with the mode on: nothing yet (quietdesk exclude add <program>)".to_string(),
+        programs => format!("On your screen even with the mode on: {}", programs.join(", ")),
+    }
+}
+
 /// Starts the tray on the real desktop as sign-in starts it, wherever this runs: apart from it, with nothing of the command that asked
 /// for it, such as a test's own state folder.
 fn start_tray() -> Result<(), String> {
@@ -169,6 +201,7 @@ fn status() -> i32 {
     say!("{}", mode_line(read_mode()));
     say!("{}", sound_line());
     say!("This shell runs on desktop: {}", quietdesk::current_desktop_name().unwrap_or_else(|e| e.to_string()));
+    say!("{}", excluded_line());
     // Per shell: a packaged app's commands, such as the Claude app's, see a copy of the console setting of their own.
     match (quietdesk::new_consoles_stay_with_their_command(), read_mode()) {
         (Ok(true), _) => say!("New consoles from this shell: the classic console, which stays with a hidden command"),

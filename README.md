@@ -67,6 +67,22 @@ times in a minute), when the next run that needs it plugs it back in. Plugging i
 A flip reaches every running session on its next command. Windows already open stay where they are: Windows cannot move a window
 between desktops. To watch what runs hidden, right-click the tray icon and choose **Show what runs hidden**.
 
+## Programs you always want to see
+
+Some programs you want on your screen even while the mode is on, say a 3D editor you work in alongside Claude. Keep your own list:
+
+```
+quietdesk exclude add blender        blender.exe now always opens on your screen
+quietdesk exclude remove blender
+quietdesk exclude list
+```
+
+The list starts empty, matches by program name (`blender`, `Blender.exe` or a full path all mean `blender.exe`), and shows in the
+tray menu and in `quietdesk status`. A Claude Code command that names a program on your list runs on your screen as a whole, with no
+prefix, so its windows open normally there. Anything else in that same command does too. The list is read as a command starts, so a
+change counts from the next command. A window of such a program, or of one started through `quietdesk visible`, that opens on the
+virtual monitor is moved to your main screen, and one that opens minimized is restored.
+
 ## How it works
 
 Windows can run programs on a desktop that is never shown. A process started there stays there, with everything it starts. Two
@@ -166,6 +182,7 @@ quietdesk visible <command...>          runs one command on the real screen
 quietdesk hidden <command...>           runs one command hidden
 quietdesk monitor <command...>          runs one command on the virtual monitor
 quietdesk mute on | off                 whether what runs out of sight is kept silent
+quietdesk exclude add | remove | list   programs that always open on your screen
 ```
 
 `<window>` is `0xHANDLE`, a process id, or part of the title, class or program name of a window out of sight. A name never

@@ -18,7 +18,7 @@
 //!
 //! The driver's interface is Parsec VDD's, as published in `core/parsec-vdd.h` of github.com/nomi-san/parsec-vdd.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, c_void};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, LPARAM, POINTL, RECT, TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DISPLAY_DEVICE_ACTIVE, DISPLAYCONFIG_PATH_ACTIVE,
     DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DISPLAY_DEVICE_PRIMARY_DEVICE,
     DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW,
@@ -64,8 +65,8 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USEPOSITION, STARTF_USESHOWWINDOW, STARTUPINFOW, SetEvent, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsHungAppWindow, IsWindow, IsWindowVisible,
-    SW_SHOWNOACTIVATE,
+    EnumWindows, GetForegroundWindow, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, ShowWindowAsync, WINDOWPLACEMENT,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
 };
 use windows_sys::core::GUID;
@@ -106,6 +107,13 @@ const STAGGER_SLOTS: i32 = 8;
 const MOVE_RETRY: Duration = Duration::from_millis(100);
 /// Every second loop: a process table costs more than the rest of the loop together.
 const FAMILY_EVERY_LOOPS: u32 = 2;
+/// How often the keeper looks for windows of the user's that landed on the monitor: five times a second.
+const THEIR_WINDOWS_EVERY_LOOPS: u32 = 8;
+/// So many tries to move one window, half a second apart: a program that keeps putting itself back is left where it wants.
+const THEIR_WINDOW_MOVES: u32 = 5;
+const THEIR_WINDOW_RETRY: Duration = Duration::from_millis(500);
+/// How far up a window's program and its parents are followed to a `quietdesk visible` that started them.
+const VISIBLE_ANCESTORS: usize = 6;
 /// How often a keeper with nothing to do asks whether the mode is still on: about once a second.
 const MODE_EVERY_LOOPS: u32 = 40;
 /// So many of those looks in a row without the display, and it is gone: a change of the user's screens can hide it for a moment.
@@ -869,6 +877,125 @@ impl FocusGuard {
     }
 }
 
+/// Windows that belong on the user's screen: of a program on their list (`quietdesk exclude`), or started through `quietdesk
+/// visible`. While the monitor is plugged in, Windows counts it among the user's screens, and a program that picks its place across
+/// all of them can open there, where nobody sees it: Blender opened maximized on it. Such a window goes to the main screen. One that
+/// first shows minimized, as a program can remember from its last run, is restored once. A window that was there before the keeper
+/// started, or that a `quietdesk monitor` command opened, is left as it is.
+struct TheirWindows {
+    seen: HashSet<isize>,
+    theirs: HashMap<isize, bool>,
+    moves: HashMap<isize, (Instant, u32)>,
+}
+
+impl TheirWindows {
+    fn new() -> Self {
+        Self { seen: top_level_windows().into_iter().collect(), theirs: HashMap::new(), moves: HashMap::new() }
+    }
+
+    fn look(&mut self, bounds: &Bounds, family: &[u32]) {
+        let alive = |handle: &isize| unsafe { IsWindow(*handle as HWND) } != 0;
+        self.seen.retain(alive);
+        self.theirs.retain(|handle, _| alive(handle));
+        self.moves.retain(|handle, _| alive(handle));
+        let excluded = crate::excluded_programs();
+        let mut table: Option<Vec<(u32, u32)>> = None;
+        for handle in top_level_windows() {
+            let hwnd = handle as HWND;
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if family.contains(&pid) || unsafe { IsWindowVisible(hwnd) } == 0 {
+                continue;
+            }
+            let new = self.seen.insert(handle);
+            let theirs = *self.theirs.entry(handle).or_insert_with(|| {
+                let name = crate::process_name(pid).to_lowercase();
+                excluded.contains(&name) || started_through_visible(pid, table.get_or_insert_with(|| process_table().unwrap_or_default()))
+            });
+            if !theirs {
+                continue;
+            }
+            if new && unsafe { IsIconic(hwnd) } != 0 {
+                unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
+                continue;
+            }
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 || rect.right - rect.left < SMALLEST_WINDOW || rect.bottom - rect.top < SMALLEST_WINDOW {
+                continue;
+            }
+            // A maximized window reaches a little past its screen's edges: its middle tells the screen.
+            if !bounds.contains((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2) {
+                continue;
+            }
+            let (last, tries) = self.moves.get(&handle).copied().unwrap_or((Instant::now() - THEIR_WINDOW_RETRY, 0));
+            if tries >= THEIR_WINDOW_MOVES || last.elapsed() < THEIR_WINDOW_RETRY {
+                continue;
+            }
+            self.moves.insert(handle, (Instant::now(), tries + 1));
+            to_the_main_screen(hwnd, &rect);
+        }
+    }
+}
+
+fn top_level_windows() -> Vec<isize> {
+    let mut handles: Vec<isize> = Vec::new();
+    unsafe { EnumWindows(Some(crate::collect_handle), &mut handles as *mut Vec<isize> as LPARAM) };
+    handles
+}
+
+/// Whether a process, or one of its parents, was started by `quietdesk visible`. A parent counts only if it started before its child:
+/// ids are reused.
+fn started_through_visible(pid: u32, table: &[(u32, u32)]) -> bool {
+    let parents: HashMap<u32, u32> = table.iter().copied().collect();
+    let mut current = pid;
+    for _ in 0..VISIBLE_ANCESTORS {
+        let Some(&parent) = parents.get(&current) else { return false };
+        let (Some(child_at), Some(parent_at)) = (started_at(current), started_at(parent)) else { return false };
+        if parent == current || parent_at > child_at {
+            return false;
+        }
+        if crate::process_name(parent).eq_ignore_ascii_case("quietdesk.exe")
+            && let Some(line) = crate::command_line_of(parent)
+            && crate::shell::plain_words(&line).is_some_and(|words| words.get(1).is_some_and(|word| word == "visible"))
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Moves a window to the middle of the main screen at its own size, maximized again if it was. Asynchronous throughout: the window's
+/// own thread does it when it is free, and a busy program never holds up the keeper.
+fn to_the_main_screen(hwnd: HWND, rect: &RECT) {
+    unsafe {
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromPoint(windows_sys::Win32::Foundation::POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY), &mut info) == 0 {
+            return;
+        }
+        let work = info.rcWork;
+        let maximized = IsZoomed(hwnd) != 0;
+        let (mut width, mut height) = (rect.right - rect.left, rect.bottom - rect.top);
+        if maximized {
+            // Its size when not maximized; the position in there is relative to the work area, the size is not.
+            let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+            placement.length = size_of::<WINDOWPLACEMENT>() as u32;
+            if GetWindowPlacement(hwnd, &mut placement) != 0 {
+                let normal = placement.rcNormalPosition;
+                (width, height) = (normal.right - normal.left, normal.bottom - normal.top);
+            }
+            ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let (width, height) = (width.min(work.right - work.left), height.min(work.bottom - work.top));
+        let (x, y) = (work.left + (work.right - work.left - width) / 2, work.top + (work.bottom - work.top - height) / 2);
+        SetWindowPos(hwnd, null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        if maximized {
+            ShowWindowAsync(hwnd, SW_MAXIMIZE);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Herd {
     slots: HashMap<isize, i32>,
@@ -1031,6 +1158,7 @@ pub fn keep() -> i32 {
         let mut looks_without_display = 0u32;
         let mut layout_changes: Vec<Instant> = Vec::new();
         let mut corner_problem: Option<String> = None;
+        let mut their_windows = TheirWindows::new();
         // The user's own main screen, to give back if Windows makes the monitor the main screen.
         let main_screen = || active_displays().into_iter().find(|display| display.is_primary && !display.is_virtual).map(|display| text_of(&display.name));
         let mut main = main_screen();
@@ -1116,6 +1244,9 @@ pub fn keep() -> i32 {
                 }
             }
             let members = family.members();
+            if loops.is_multiple_of(THEIR_WINDOWS_EVERY_LOOPS) {
+                their_windows.look(&bounds, &members);
+            }
             focus.check(&members);
             if !members.is_empty() {
                 anything_joined = true;

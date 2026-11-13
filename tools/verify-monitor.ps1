@@ -5,6 +5,8 @@ on the monitor, also when the command that started it ended at once. Exit codes 
 When Windows switches the monitor off, as a change of your screens can, it is shown again where it was, with no new plug-in. A window that
 opens on your screen is off it within a few milliseconds when its program is free; one whose program is busy as it opens stays until the
 program is free again, because Windows lets only a window's own thread move it.
+A window that belongs on your screen and opens on the monitor, of a program on your list (`quietdesk exclude`) or started through
+`quietdesk visible`, comes to your main screen, and one that opens minimized is restored; any other stays where it opened.
 
 Its windows are fully transparent and take no focus and no input, so nobody sees them even where they must not end up. It needs the
 monitor already plugged in, so that it never plugs one in itself: run it with the mode on. Its last step switches the monitor off once,
@@ -201,6 +203,72 @@ $timer.Start()
     Report 'a window whose program is free leaves your screen within 50 ms' (@($flashes | Where-Object { $_ -isnot [double] -and $_ -isnot [int] -or $_ -gt 50 }).Count -eq 0) "ms on your screen: $($flashes -join ', ')"
     $busyFlash = Measure-Flash 1000
     "  a window whose program is busy for 1000 ms as it opens stays on your screen for $busyFlash ms: only its own thread can move it"
+
+    '--- windows that belong on your screen leave the monitor'
+    # A small window program that opens on the monitor, maximized, minimized or as it is, and notes after a while which screen it
+    # ended on, from inside itself. Copies under their own names, so the list can name one and not another.
+    $theirSource = Join-Path $here 'their-window.cs'
+    Set-Content -LiteralPath $theirSource -Encoding ascii -Value @'
+using System; using System.Drawing; using System.IO; using System.Runtime.InteropServices; using System.Windows.Forms;
+class TheirWindow : Form {
+    [StructLayout(LayoutKind.Sequential)] struct MonitorInfo { public int Size; public int L, T, R, B, WL, WT, WR, WB; public uint Flags; }
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+    [DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr m, ref MonitorInfo info);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
+    const int Layered = 0x80000, ClickThrough = 0x20, NoActivate = 0x8000000;
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams { get { CreateParams p = base.CreateParams; p.ExStyle |= Layered | ClickThrough | NoActivate; return p; } }
+    [STAThread] static void Main(string[] a) {
+        var w = new TheirWindow();
+        w.StartPosition = FormStartPosition.Manual; w.Location = new Point(int.Parse(a[1]), int.Parse(a[2])); w.Size = new Size(400, 300);
+        w.Opacity = 0; w.ShowInTaskbar = false;
+        if (a[3] == "max") w.WindowState = FormWindowState.Maximized;
+        if (a[3] == "min") w.WindowState = FormWindowState.Minimized;
+        var timer = new Timer(); timer.Interval = int.Parse(a[4]);
+        timer.Tick += (sender, e) => {
+            timer.Stop();
+            var info = new MonitorInfo(); info.Size = Marshal.SizeOf(typeof(MonitorInfo));
+            GetMonitorInfoW(MonitorFromWindow(w.Handle, 2), ref info);
+            File.WriteAllText(a[0], string.Format("primary={0} minimized={1} maximized={2}", (info.Flags & 1) != 0, IsIconic(w.Handle), IsZoomed(w.Handle)));
+            w.Close();
+        };
+        timer.Start();
+        Application.Run(w);
+    }
+}
+'@
+    $theirExe = Join-Path $here 'their-window.exe'
+    & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /r:System.Windows.Forms.dll /r:System.Drawing.dll "/out:$theirExe" $theirSource | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'the window program did not compile' }
+    $tag = "qd-verify-$PID"
+    function Start-TheirWindow([string]$Name, [string]$State, [bool]$ThroughVisible) {
+        $copy = Join-Path $here "$Name.exe"
+        Copy-Item -LiteralPath $theirExe -Destination $copy -Force
+        $result = Join-Path $here "$Name.txt"
+        $arguments = @($result, ($left + 120), ($top + 120), $State, 4000)
+        if ($ThroughVisible) { & $quietdesk visible $copy @arguments }
+        else { & $quietdesk visible cmd.exe /c start '""' $copy @arguments }
+        $deadline = (Get-Date).AddSeconds(20)
+        while (-not (Test-Path -LiteralPath $result) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+        return "$(Get-Content -Raw -LiteralPath $result -ErrorAction SilentlyContinue)".Trim()
+    }
+    & $quietdesk exclude add "$tag-listed" | Out-Null
+    & $quietdesk exclude add "$tag-listed-minimized" | Out-Null
+    try {
+        $listed = Start-TheirWindow "$tag-listed" 'max' $false
+        Report 'a listed program that opens maximized on the monitor is maximized on your main screen' ($listed -eq 'primary=True minimized=False maximized=True') $listed
+        $visible = Start-TheirWindow "$tag-visible" 'normal' $true
+        Report 'a program started through quietdesk visible is on your main screen' ($visible -match '^primary=True minimized=False') $visible
+        $other = Start-TheirWindow "$tag-other" 'normal' $false
+        Report 'any other program stays where it opened' ($other -match '^primary=False minimized=False') $other
+        $minimized = Start-TheirWindow "$tag-listed-minimized" 'min' $false
+        Report 'a listed program that opens minimized is restored, on your main screen' ($minimized -match '^primary=True minimized=False') $minimized
+    }
+    finally {
+        & $quietdesk exclude remove "$tag-listed" | Out-Null
+        & $quietdesk exclude remove "$tag-listed-minimized" | Out-Null
+    }
 
     '--- what a command costs now, against one with no monitor (medians of 15; no limit: read it)'
     foreach ($word in 'visible', 'monitor') {

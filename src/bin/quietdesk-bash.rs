@@ -134,7 +134,7 @@ fn main() {
         eprintln!("quietdesk: no command given");
         std::process::exit(MISUSED);
     };
-    let place = quietdesk::decide_place(false);
+    let place = quietdesk::decide_place_for(false, &arguments.join(" "));
     let parent = bash_parent();
 
     if parent.is_none()

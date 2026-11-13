@@ -9,5 +9,6 @@ The user turns this on so test windows do not disturb them: `quietdesk on`, `qui
 - Only what needs the keyboard focus, or the user's eyes, goes on the real screen with `quietdesk visible <command>`. A test that needs the real screen wins over not disturbing.
 - Known cases: Edge needs `quietdesk monitor`, and apps built on it may too. OpenGL windows capture black when hidden, so use their own screenshots or `quietdesk monitor`. A check of display timing is wrong while a full-screen game holds the main screen: rerun it when the game is closed, and report it as not run.
 - A window you leave open for the user to try needs `quietdesk visible`, or they will never see it.
+- Programs on the user's own list (`quietdesk exclude list`) always open on their screen: a command that names one runs there as a whole, with no prefix. Start such a program in a command of its own, never with tests in it. The list is read as a command starts, so a change counts from the next command. Change the list (`quietdesk exclude add|remove <program>`) only when the user asks.
 - A hidden dialog waiting for an answer looks like a hang: check with `quietdesk windows` and `quietdesk shot`.
 - The `quietdesk` skill has the details.

@@ -33,6 +33,9 @@ fn main() {
         eprintln!("quietdesk: no PowerShell 7 ({REAL_NAME}) after this one, on PATH or where Claude Code looks; install it, or uninstall QuietDesk");
         std::process::exit(NOT_FOUND);
     };
-    let place = quietdesk::decide_place(true);
-    std::process::exit(quietdesk::forward(&real, &quietdesk::arguments_after_program(), place));
+    let arguments = quietdesk::arguments_after_program();
+    // Claude Code's PowerShell tool hands its command over in this variable; anything else has it in its arguments.
+    let command = std::env::var("CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT").unwrap_or_else(|_| String::from_utf16_lossy(&arguments));
+    let place = quietdesk::decide_place_for(true, &command);
+    std::process::exit(quietdesk::forward(&real, &arguments, place));
 }

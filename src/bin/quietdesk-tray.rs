@@ -172,6 +172,14 @@ unsafe fn show_menu(tray: HWND) {
         AppendMenuW(menu, MF_STRING, MENU_FLIP as usize, flip_text.as_ptr());
         AppendMenuW(menu, sound_flags, MENU_SOUND as usize, sound_text.as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_PREVIEW as usize, preview_text.as_ptr());
+        // The list is changed with `quietdesk exclude`; here it is only shown.
+        let programs = quietdesk::excluded_programs();
+        let excluded = wide(if programs.is_empty() {
+            "Always on your screen: nothing (quietdesk exclude add <program>)".to_string()
+        } else {
+            format!("Always on your screen: {}", programs.join(", "))
+        });
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, excluded.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit_text.as_ptr());
         let mut cursor = POINT { x: 0, y: 0 };
