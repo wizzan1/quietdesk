@@ -35,9 +35,19 @@ quietdesk start-tray | quit-tray
     Starts the tray icon on your screen, or asks it to close. Install and uninstall do this.
 quietdesk exclude add | remove <program>
 quietdesk exclude list
-    Programs that open on your screen even while the mode is on, such as Blender: a command that names one runs on your screen,
-    and while the mode is on, their windows that open on the virtual monitor, or minimized, come to your main screen.
+    Your own list of programs that stay on your screen even while the mode is on, such as an editor you work in.
+";
 
+const EXCLUDE_USAGE: &str = "\
+quietdesk exclude add <program>       keeps a program on your screen even while the mode is on
+quietdesk exclude remove <program>    hides it again, like everything else
+quietdesk exclude list                shows your list
+
+<program> is its name, with or without .exe, or its full path: blender, Blender.exe and
+\"C:\\Program Files\\Blender Foundation\\Blender 5.2\\blender.exe\" all mean blender.exe.
+A Claude Code command that starts a program on your list runs on your screen, from the next command on.";
+
+const WINDOW_USAGE: &str = "\
 Windows, wherever they run. <window> is 0xHANDLE, a process id, or part of the title, class or
 program name of a window out of sight (a name never matches your own windows on the real screen):
 quietdesk windows                       the windows out of sight
@@ -87,8 +97,12 @@ fn main() {
             say!("{}", excluded_line());
             0
         }
+        ["exclude", ..] => {
+            eprintln!("{EXCLUDE_USAGE}");
+            USAGE_ERROR
+        }
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{USAGE}\n{WINDOW_USAGE}");
             USAGE_ERROR
         }
     };

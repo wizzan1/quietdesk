@@ -20,6 +20,7 @@ It works with Claude Code today. The name is not tied to it: other agents, such 
   keep their sound.
 - **Your focus back:** if a test window takes the focus anyway, it is given back.
 - **One switch for every session:** the tray icon, `quietdesk on` and `quietdesk off`, or just ask the agent.
+- **Your own exceptions:** programs you always want to see, such as an editor you work in beside the agent, stay on your screen.
 - **No weaker tests:** the agent is told never to test less because of it, and how to handle what behaves differently hidden.
 
 ## Requirements
@@ -69,19 +70,24 @@ between desktops. To watch what runs hidden, right-click the tray icon and choos
 
 ## Programs you always want to see
 
-Some programs you want on your screen even while the mode is on, say a 3D editor you work in alongside Claude. Keep your own list:
+Some programs you want on your screen even while the mode is on, say a 3D editor you work in beside Claude. Put them on your
+own list. Blender is only the example here: any program works, and the list starts empty.
 
-```
-quietdesk exclude add blender        blender.exe now always opens on your screen
-quietdesk exclude remove blender
-quietdesk exclude list
-```
+| Command | What it does |
+| --- | --- |
+| `quietdesk exclude add blender` | Blender opens on your screen from now on, even with the mode on |
+| `quietdesk exclude remove blender` | Blender is hidden again, like everything else |
+| `quietdesk exclude list` | Shows your list. The tray menu and `quietdesk status` show it too |
 
-The list starts empty, matches by program name (`blender`, `Blender.exe` or a full path all mean `blender.exe`), and shows in the
-tray menu and in `quietdesk status`. A Claude Code command that names a program on your list runs on your screen as a whole, with no
-prefix, so its windows open normally there. Anything else in that same command does too. The list is read as a command starts, so a
-change counts from the next command. A window of such a program, or of one started through `quietdesk visible`, that opens on the
-virtual monitor is moved to your main screen, and one that opens minimized is restored.
+- **Name the program as you like:** `blender`, `Blender.exe` or its full path all mean `blender.exe`.
+- **What it changes:** when Claude Code runs a command that starts a program on your list, that command runs on your screen, as if
+  the mode were off, so the program's windows open normally. Anything else in that same command shows too, so Claude is told to
+  start such a program in a command of its own.
+- **When it counts:** from Claude's next command. One already running stays where it started.
+- **If Windows puts its window out of sight:** the virtual monitor counts as a screen to Windows, so a window can open there, or
+  be put back there when the monitor returns. QuietDesk moves any window of a program on your list, or started through
+  `quietdesk visible`, from the virtual monitor to your main screen, whenever it lands there, and restores one that opens
+  minimized.
 
 ## How it works
 

@@ -6,7 +6,8 @@ When Windows switches the monitor off, as a change of your screens can, it is sh
 opens on your screen is off it within a few milliseconds when its program is free; one whose program is busy as it opens stays until the
 program is free again, because Windows lets only a window's own thread move it.
 A window that belongs on your screen and opens on the monitor, of a program on your list (`quietdesk exclude`) or started through
-`quietdesk visible`, comes to your main screen, and one that opens minimized is restored; any other stays where it opened.
+`quietdesk visible`, comes to your main screen, and so does one that lands there again and again, or whose program is put on the
+list while it is there; one that opens minimized is restored; any other stays where it opened.
 
 Its windows are fully transparent and take no focus and no input, so nobody sees them even where they must not end up. It needs the
 monitor already plugged in, so that it never plugs one in itself: run it with the mode on. Its last step switches the monitor off once,
@@ -206,7 +207,9 @@ $timer.Start()
 
     '--- windows that belong on your screen leave the monitor'
     # A small window program that opens on the monitor, maximized, minimized or as it is, and notes after a while which screen it
-    # ended on, from inside itself. Copies under their own names, so the list can name one and not another.
+    # ended on, from inside itself. Asked to, it puts itself back on the monitor each time it finds itself on the main screen, as
+    # Windows does with a window when the monitor returns, and counts how often. Copies under their own names, so the list can name
+    # one and not another.
     $theirSource = Join-Path $here 'their-window.cs'
     Set-Content -LiteralPath $theirSource -Encoding ascii -Value @'
 using System; using System.Drawing; using System.IO; using System.Runtime.InteropServices; using System.Windows.Forms;
@@ -225,12 +228,19 @@ class TheirWindow : Form {
         w.Opacity = 0; w.ShowInTaskbar = false;
         if (a[3] == "max") w.WindowState = FormWindowState.Maximized;
         if (a[3] == "min") w.WindowState = FormWindowState.Minimized;
+        int returns = a.Length > 5 ? int.Parse(a[5]) : 0, returned = 0;
+        var info = new MonitorInfo(); info.Size = Marshal.SizeOf(typeof(MonitorInfo));
+        var back = new Timer(); back.Interval = 1500;
+        back.Tick += (sender, e) => {
+            GetMonitorInfoW(MonitorFromWindow(w.Handle, 2), ref info);
+            if ((info.Flags & 1) != 0 && returned < returns) { w.Location = new Point(int.Parse(a[1]), int.Parse(a[2])); returned++; }
+        };
+        if (returns > 0) back.Start();
         var timer = new Timer(); timer.Interval = int.Parse(a[4]);
         timer.Tick += (sender, e) => {
-            timer.Stop();
-            var info = new MonitorInfo(); info.Size = Marshal.SizeOf(typeof(MonitorInfo));
+            timer.Stop(); back.Stop();
             GetMonitorInfoW(MonitorFromWindow(w.Handle, 2), ref info);
-            File.WriteAllText(a[0], string.Format("primary={0} minimized={1} maximized={2}", (info.Flags & 1) != 0, IsIconic(w.Handle), IsZoomed(w.Handle)));
+            File.WriteAllText(a[0], string.Format("primary={0} minimized={1} maximized={2} returned={3}", (info.Flags & 1) != 0, IsIconic(w.Handle), IsZoomed(w.Handle), returned));
             w.Close();
         };
         timer.Start();
@@ -242,14 +252,19 @@ class TheirWindow : Form {
     & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /r:System.Windows.Forms.dll /r:System.Drawing.dll "/out:$theirExe" $theirSource | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'the window program did not compile' }
     $tag = "qd-verify-$PID"
-    function Start-TheirWindow([string]$Name, [string]$State, [bool]$ThroughVisible) {
+    function Start-TheirWindow([string]$Name, [string]$State, [bool]$ThroughVisible, [int]$Wait = 4000, [int]$Returns = 0, [scriptblock]$During) {
         $copy = Join-Path $here "$Name.exe"
         Copy-Item -LiteralPath $theirExe -Destination $copy -Force
         $result = Join-Path $here "$Name.txt"
-        $arguments = @($result, ($left + 120), ($top + 120), $State, 4000)
+        Remove-Item -LiteralPath $result -ErrorAction SilentlyContinue
+        $arguments = @($result, ($left + 120), ($top + 120), $State, $Wait, $Returns)
+        # The start below returns only once the window has gone, because the window holds this shell's output, which `start` passes
+        # on. What must happen while it is open runs beside it, given quietdesk.exe and the program's name.
+        $beside = if ($During) { Start-ThreadJob -ScriptBlock $During -ArgumentList $quietdesk, $Name }
         if ($ThroughVisible) { & $quietdesk visible $copy @arguments }
         else { & $quietdesk visible cmd.exe /c start '""' $copy @arguments }
-        $deadline = (Get-Date).AddSeconds(20)
+        if ($beside) { $beside | Receive-Job -Wait -AutoRemoveJob | Out-Null }
+        $deadline = (Get-Date).AddMilliseconds($Wait + 16000)
         while (-not (Test-Path -LiteralPath $result) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
         return "$(Get-Content -Raw -LiteralPath $result -ErrorAction SilentlyContinue)".Trim()
     }
@@ -257,17 +272,23 @@ class TheirWindow : Form {
     & $quietdesk exclude add "$tag-listed-minimized" | Out-Null
     try {
         $listed = Start-TheirWindow "$tag-listed" 'max' $false
-        Report 'a listed program that opens maximized on the monitor is maximized on your main screen' ($listed -eq 'primary=True minimized=False maximized=True') $listed
+        Report 'a listed program that opens maximized on the monitor is maximized on your main screen' ($listed -match '^primary=True minimized=False maximized=True') $listed
         $visible = Start-TheirWindow "$tag-visible" 'normal' $true
         Report 'a program started through quietdesk visible is on your main screen' ($visible -match '^primary=True minimized=False') $visible
         $other = Start-TheirWindow "$tag-other" 'normal' $false
         Report 'any other program stays where it opened' ($other -match '^primary=False minimized=False') $other
         $minimized = Start-TheirWindow "$tag-listed-minimized" 'min' $false
         Report 'a listed program that opens minimized is restored, on your main screen' ($minimized -match '^primary=True minimized=False') $minimized
+        # More often than the keeper once allowed one window in its whole life: five.
+        $again = Start-TheirWindow "$tag-listed" 'normal' $false 14000 7
+        Report 'a listed window that lands on the monitor again and again comes back each time' ($again -eq 'primary=True minimized=False maximized=False returned=7') $again
+        $added = Start-TheirWindow "$tag-added" 'normal' $false 7000 0 { param($quietdesk, $name) Start-Sleep -Seconds 2; & $quietdesk exclude add $name | Out-Null }
+        Report 'a program put on the list while its window is on the monitor comes to your main screen' ($added -match '^primary=True minimized=False') $added
     }
     finally {
         & $quietdesk exclude remove "$tag-listed" | Out-Null
         & $quietdesk exclude remove "$tag-listed-minimized" | Out-Null
+        & $quietdesk exclude remove "$tag-added" | Out-Null
     }
 
     '--- what a command costs now, against one with no monitor (medians of 15; no limit: read it)'

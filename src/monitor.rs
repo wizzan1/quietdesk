@@ -18,7 +18,7 @@
 //!
 //! The driver's interface is Parsec VDD's, as published in `core/parsec-vdd.h` of github.com/nomi-san/parsec-vdd.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, c_void};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -109,8 +109,11 @@ const MOVE_RETRY: Duration = Duration::from_millis(100);
 const FAMILY_EVERY_LOOPS: u32 = 2;
 /// How often the keeper looks for windows of the user's that landed on the monitor: five times a second.
 const THEIR_WINDOWS_EVERY_LOOPS: u32 = 8;
-/// So many tries to move one window, half a second apart: a program that keeps putting itself back is left where it wants.
-const THEIR_WINDOW_MOVES: u32 = 5;
+/// A window found on the monitor is moved off it whenever it lands there, half a second apart at most, and at most so many times a
+/// minute: enough for a busy program, which takes the moves once it is free, and for one that lands there again later, without
+/// fighting a program that keeps putting itself back.
+const THEIR_WINDOW_MOVES: usize = 12;
+const THEIR_WINDOW_MOVES_PER: Duration = Duration::from_secs(60);
 const THEIR_WINDOW_RETRY: Duration = Duration::from_millis(500);
 /// How far up a window's program and its parents are followed to a `quietdesk visible` that started them.
 const VISIBLE_ANCESTORS: usize = 6;
@@ -879,24 +882,27 @@ impl FocusGuard {
 
 /// Windows that belong on the user's screen: of a program on their list (`quietdesk exclude`), or started through `quietdesk
 /// visible`. While the monitor is plugged in, Windows counts it among the user's screens, and a program that picks its place across
-/// all of them can open there, where nobody sees it: Blender opened maximized on it. Such a window goes to the main screen. One that
-/// first shows minimized, as a program can remember from its last run, is restored once. A window that was there before the keeper
-/// started, or that a `quietdesk monitor` command opened, is left as it is.
+/// all of them can open there, where nobody sees it: Blender opened maximized on it. A window can also land there later: Windows
+/// puts back the windows that were on a screen when it returns, as the monitor does each time a keeper starts, and a program can
+/// restore a place it saved there. Such a window goes to the main screen whenever it is found there, for as long as it lives. One
+/// that first shows minimized, as a program can remember from its last run, is restored once. A window that a `quietdesk monitor`
+/// command opened is never touched.
 struct TheirWindows {
     seen: HashSet<isize>,
-    theirs: HashMap<isize, bool>,
-    moves: HashMap<isize, (Instant, u32)>,
+    /// Whether a window's program was started through `quietdesk visible`, which cannot change. The list can, so it is read each time.
+    through_visible: HashMap<isize, bool>,
+    moves: HashMap<isize, VecDeque<Instant>>,
 }
 
 impl TheirWindows {
     fn new() -> Self {
-        Self { seen: top_level_windows().into_iter().collect(), theirs: HashMap::new(), moves: HashMap::new() }
+        Self { seen: top_level_windows().into_iter().collect(), through_visible: HashMap::new(), moves: HashMap::new() }
     }
 
     fn look(&mut self, bounds: &Bounds, family: &[u32]) {
         let alive = |handle: &isize| unsafe { IsWindow(*handle as HWND) } != 0;
         self.seen.retain(alive);
-        self.theirs.retain(|handle, _| alive(handle));
+        self.through_visible.retain(|handle, _| alive(handle));
         self.moves.retain(|handle, _| alive(handle));
         let excluded = crate::excluded_programs();
         let mut table: Option<Vec<(u32, u32)>> = None;
@@ -908,30 +914,37 @@ impl TheirWindows {
                 continue;
             }
             let new = self.seen.insert(handle);
-            let theirs = *self.theirs.entry(handle).or_insert_with(|| {
-                let name = crate::process_name(pid).to_lowercase();
-                excluded.contains(&name) || started_through_visible(pid, table.get_or_insert_with(|| process_table().unwrap_or_default()))
-            });
+            let minimized = unsafe { IsIconic(hwnd) } != 0;
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            // A maximized window reaches a little past its screen's edges: its middle tells the screen.
+            let on_the_monitor = !minimized
+                && unsafe { GetWindowRect(hwnd, &mut rect) } != 0
+                && rect.right - rect.left >= SMALLEST_WINDOW
+                && rect.bottom - rect.top >= SMALLEST_WINDOW
+                && bounds.contains((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            if !(on_the_monitor || (new && minimized)) {
+                continue;
+            }
+            let theirs = excluded.contains(&crate::process_name(pid).to_lowercase())
+                || *self
+                    .through_visible
+                    .entry(handle)
+                    .or_insert_with(|| started_through_visible(pid, table.get_or_insert_with(|| process_table().unwrap_or_default())));
             if !theirs {
                 continue;
             }
-            if new && unsafe { IsIconic(hwnd) } != 0 {
+            if minimized {
                 unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
                 continue;
             }
-            let mut rect: RECT = unsafe { std::mem::zeroed() };
-            if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 || rect.right - rect.left < SMALLEST_WINDOW || rect.bottom - rect.top < SMALLEST_WINDOW {
+            let recent = self.moves.entry(handle).or_default();
+            while recent.front().is_some_and(|at| at.elapsed() >= THEIR_WINDOW_MOVES_PER) {
+                recent.pop_front();
+            }
+            if recent.len() >= THEIR_WINDOW_MOVES || recent.back().is_some_and(|at| at.elapsed() < THEIR_WINDOW_RETRY) {
                 continue;
             }
-            // A maximized window reaches a little past its screen's edges: its middle tells the screen.
-            if !bounds.contains((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2) {
-                continue;
-            }
-            let (last, tries) = self.moves.get(&handle).copied().unwrap_or((Instant::now() - THEIR_WINDOW_RETRY, 0));
-            if tries >= THEIR_WINDOW_MOVES || last.elapsed() < THEIR_WINDOW_RETRY {
-                continue;
-            }
-            self.moves.insert(handle, (Instant::now(), tries + 1));
+            recent.push_back(Instant::now());
             to_the_main_screen(hwnd, &rect);
         }
     }
