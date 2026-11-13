@@ -19,9 +19,11 @@ It works with Claude Code today. The name is not tied to it: other agents, such 
 - **Silent test runs:** what runs out of sight is muted the moment it opens its sound, before it is heard. Your own apps and games
   keep their sound.
 - **Your focus back:** if a test window takes the focus anyway, it is given back.
-- **One switch for every session:** the tray icon, `quietdesk on` and `quietdesk off`, or just ask the agent.
-- **Your own exceptions:** programs you always want to see, such as an editor you work in beside the agent, stay on your screen.
-- **No weaker tests:** the agent is told never to test less because of it, and how to handle what behaves differently hidden.
+- **One switch for every session:** click the tray icon, or run `quietdesk on` and `quietdesk off`.
+- **Your own exceptions:** programs you always want to see, such as an editor you work in, stay on your screen. Pick them in the
+  tray menu.
+- **No weaker tests:** the install tells the agent never to test less because of QuietDesk, and how to handle what behaves
+  differently hidden.
 
 ## Requirements
 
@@ -56,8 +58,7 @@ you turn it on. Installing changes these, and `pwsh -File tools\uninstall.ps1` t
 
 ## Turning it on and off
 
-- Click the tray icon: a red disc with a white bar means on, a grey ring means off.
-- Or tell any Claude Code session: "quiet desk on", "hide the windows", "show the windows".
+- Click the tray icon: a red disc with a white bar means on, a grey ring means off. Right-click it for the menu.
 - Or run `quietdesk on`, `quietdesk off`, `quietdesk toggle`, `quietdesk status`.
 
 **Turn it on before you start a game.** Turning it on plugs in the virtual monitor, and turning it off unplugs it. Windows treats
@@ -70,24 +71,33 @@ between desktops. To watch what runs hidden, right-click the tray icon and choos
 
 ## Programs you always want to see
 
-Some programs you want on your screen even while the mode is on, say a 3D editor you work in beside Claude. Put them on your
-own list. Blender is only the example here: any program works, and the list starts empty.
+Some programs you want on your screen even while the mode is on, say a 3D editor you work in while the agent drives it. Keep
+your own list of them. It starts empty, and any program can go on it.
+
+**In the tray:** right-click the icon and open **Always on your screen**.
+
+- **Add an open program** lists the programs that have a window open on your screen now. Click one to add it.
+- **Add a program file...** lets you pick any program file.
+- The programs on your list are ticked. Click one to take it off.
+
+**From the command line,** the same list:
 
 | Command | What it does |
 | --- | --- |
 | `quietdesk exclude add blender` | Blender opens on your screen from now on, even with the mode on |
 | `quietdesk exclude remove blender` | Blender is hidden again, like everything else |
-| `quietdesk exclude list` | Shows your list. The tray menu and `quietdesk status` show it too |
+| `quietdesk exclude list` | Shows your list. `quietdesk status` shows it too |
 
-- **Name the program as you like:** `blender`, `Blender.exe` or its full path all mean `blender.exe`.
-- **What it changes:** when Claude Code runs a command that starts a program on your list, that command runs on your screen, as if
-  the mode were off, so the program's windows open normally. Anything else in that same command shows too, so Claude is told to
-  start such a program in a command of its own.
-- **When it counts:** from Claude's next command. One already running stays where it started.
-- **If Windows puts its window out of sight:** the virtual monitor counts as a screen to Windows, so a window can open there, or
-  be put back there when the monitor returns. QuietDesk moves any window of a program on your list, or started through
-  `quietdesk visible`, from the virtual monitor to your main screen, whenever it lands there, and restores one that opens
-  minimized.
+How it behaves:
+
+- **A program is known by its file name:** `blender`, `Blender.exe` and its full path all mean `blender.exe`.
+- **What changes:** a command the agent runs that starts a program on your list runs on your screen, as if the mode were off, so
+  the program's windows open normally. Anything else started by that same command shows too, so the agent is told to start such a
+  program in a command of its own.
+- **When it counts:** from the agent's next command. A program already running stays where it started.
+- **Its windows are never lost out of sight:** Windows counts the virtual monitor as a screen, so a window can open there, or be
+  put back there when the monitor returns. QuietDesk moves any window of a program on your list, or started through
+  `quietdesk visible`, from the virtual monitor to your main screen whenever it lands there, and restores one that opens minimized.
 
 ## How it works
 

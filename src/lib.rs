@@ -40,8 +40,10 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW, STARTUPINFOW,
     WaitForSingleObject,
 };
+use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetClientRect, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+    GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WS_EX_TOOLWINDOW,
 };
 
 pub const HIDDEN_DESKTOP: &str = "QuietDesk";
@@ -391,10 +393,8 @@ pub enum Place {
     Real,
 }
 
-/// Where a command Claude Code starts belongs. Only the first shim of a run decides; `require_claude` keeps the user's
-/// own `pwsh` out of it, because the pwsh shim is on the user's PATH.
 /// Programs the user wants on their screen even while the mode is on: things to look at, not tests, such as Blender. One program
-/// file name a line, as `quietdesk exclude` keeps them.
+/// file name a line, as `quietdesk exclude` and the tray keep them.
 fn excluded_file() -> PathBuf {
     state_dir().join("always-on-your-screen")
 }
@@ -458,12 +458,64 @@ pub fn names_an_excluded_program(command: &str) -> bool {
     names_a_program(command, &excluded_programs())
 }
 
+/// Programs never offered for the list: QuietDesk's own, and Windows' own, which host other programs' windows or the shell.
+const NEVER_OFFERED: [&str; 9] = [
+    "quietdesk.exe",
+    "quietdesk-tray.exe",
+    "quietdesk-bash.exe",
+    "explorer.exe",
+    "applicationframehost.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "searchhost.exe",
+    "textinputhost.exe",
+];
+
+/// The programs to offer for the list, from those with a window open: each once, by its name as the list keeps it, in order, and
+/// none already on the list or never offered.
+pub fn programs_to_offer(open: &[String], listed: &[String]) -> Vec<String> {
+    let mut offered: Vec<String> = open
+        .iter()
+        .filter_map(|name| program_name(name))
+        .filter(|name| !listed.contains(name) && !NEVER_OFFERED.contains(&name.as_str()))
+        .collect();
+    offered.sort();
+    offered.dedup();
+    offered
+}
+
+/// A window as the taskbar would show it: no owner, not a tool window, with a title, and not cloaked (a Store app's window that is
+/// not on screen).
+fn is_app_window(window: &Window) -> bool {
+    let hwnd = window.hwnd as HWND;
+    let extended = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    let mut cloaked: u32 = 0;
+    let cloak_read = unsafe { DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), size_of::<u32>() as u32) };
+    !window.title.trim().is_empty()
+        && unsafe { GetWindow(hwnd, GW_OWNER) }.is_null()
+        && extended & WS_EX_TOOLWINDOW == 0
+        && !(cloak_read == 0 && cloaked != 0)
+}
+
+/// The programs with a window open on a desktop, to offer for the list: on the real one, the user's own. A window on the virtual
+/// monitor is a test's, and not offered.
+pub fn open_programs_on(desktop: &Desktop) -> Vec<String> {
+    let monitor = monitor::current_bounds();
+    let names: Vec<String> = windows_on(desktop)
+        .into_iter()
+        .filter(|window| is_app_window(window) && !monitor.as_ref().is_some_and(|bounds| monitor::holds(bounds, window)))
+        .map(|window| process_name(window.pid))
+        .collect();
+    programs_to_offer(&names, &excluded_programs())
+}
+
 pub fn decide_place(require_claude: bool) -> Place {
     decide_place_for(require_claude, "")
 }
 
-/// Where a command Claude Code starts belongs, by its own text: a command that names a program on the user's list runs on their
-/// screen even while the mode is on, as a whole.
+/// Where a command Claude Code starts belongs. Only the first shim of a run decides; `require_claude` keeps the user's own `pwsh`
+/// out of it, because the pwsh shim is on the user's PATH. By the command's own text: a command that names a program on the user's
+/// list runs on their screen even while the mode is on, as a whole.
 pub fn decide_place_for(require_claude: bool, command: &str) -> Place {
     if std::env::var_os(DECIDED_VAR).is_some() {
         return Place::Inherit;
@@ -1131,6 +1183,49 @@ unsafe fn print_window(hwnd: HWND, width: i32, height: i32) -> io::Result<Pictur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tray_offers_each_open_program_once_and_none_already_listed() {
+        let open: Vec<String> = ["Blender.exe", "blender.exe", "notepad.exe", "Code.exe", "explorer.exe", "quietdesk-tray.exe"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let listed = vec!["notepad.exe".to_string()];
+        assert_eq!(programs_to_offer(&open, &listed), ["blender.exe", "code.exe"]);
+        assert!(programs_to_offer(&[], &listed).is_empty());
+    }
+
+    /// A program's main window is offered; a tool window or a window owned by another is not, as the taskbar shows them. On the
+    /// hidden desktop, so nothing shows on anyone's screen.
+    #[test]
+    fn the_programs_offered_are_those_with_a_window_the_taskbar_would_show() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_POPUP, WS_VISIBLE};
+        let found = on_desktop(true, || {
+            let (class, title) = (wide("STATIC"), wide("QuietDesk test window"));
+            let make = |extended: u32, owner: HWND| unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | extended, class.as_ptr(), title.as_ptr(), WS_POPUP | WS_VISIBLE,
+                    -32000, -32000, 120, 80, owner, null_mut(), null_mut(), null(),
+                )
+            };
+            let main = make(0, null_mut());
+            let tool = make(WS_EX_TOOLWINDOW, null_mut());
+            let owned = make(0, main);
+            let windows = windows_on(&Desktop::hidden()?);
+            let judged = |hwnd: HWND| windows.iter().find(|window| window.hwnd == hwnd as isize).map(is_app_window);
+            let result = (judged(main), judged(tool), judged(owned), open_programs_on(&Desktop::hidden()?));
+            unsafe {
+                DestroyWindow(owned);
+                DestroyWindow(tool);
+                DestroyWindow(main);
+            }
+            Ok(result)
+        })
+        .unwrap();
+        assert_eq!((found.0, found.1, found.2), (Some(true), Some(false), Some(false)));
+        let this_program = program_name(&process_name(std::process::id())).unwrap();
+        assert!(found.3.contains(&this_program), "{this_program} not offered among {:?}", found.3);
+    }
 
     /// A held file once read as off, and the keeper unplugged the monitor with the mode on.
     #[test]

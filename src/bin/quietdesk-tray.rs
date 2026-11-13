@@ -1,7 +1,8 @@
-//! The tray icon: shows whether QuietDesk is on, flips it with a click, and opens a live preview of what runs hidden,
-//! where a stuck window can also be closed. The mode does not depend on this program: closing it changes nothing.
+//! The tray icon: shows whether QuietDesk is on, flips it with a click, keeps the list of programs always on the user's screen,
+//! and opens a live preview of what runs hidden, where a stuck window can also be closed. The mode does not depend on this
+//! program: closing it changes nothing.
 
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
@@ -17,14 +18,17 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_DONTADDTORECENT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BN_CLICKED, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, HICON, ICONINFO,
+    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, HICON, HMENU, ICONINFO,
     IDC_ARROW, LB_ADDSTRING, LB_ERR, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBN_SELCHANGE, LBS_NOTIFY,
-    LoadCursorW, MB_ICONWARNING, MB_OK, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
+    LoadCursorW, MB_ICONWARNING, MB_OK, MF_CHECKED, MF_DISABLED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetTimer, ShowWindow,
     SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
     WM_ERASEBKGND, WM_LBUTTONUP, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER,
@@ -45,6 +49,11 @@ const MENU_FLIP: u32 = 100;
 const MENU_PREVIEW: u32 = 101;
 const MENU_QUIT: u32 = 102;
 const MENU_SOUND: u32 = 103;
+const MENU_ADD_FILE: u32 = 104;
+/// The programs on the list, then the open programs to add, each numbered from here: up to `MENU_PROGRAMS` of each.
+const MENU_LISTED: u32 = 1000;
+const MENU_OPEN: u32 = 2000;
+const MENU_PROGRAMS: usize = 500;
 const CONTROL_LIST: usize = 10;
 const CONTROL_CLOSE: usize = 11;
 const LIST_WIDTH: i32 = 320;
@@ -119,7 +128,7 @@ unsafe fn make_icon(mode: Mode) -> HICON {
 
 fn tip(mode: Mode) -> &'static str {
     match mode {
-        Mode::On => "QuietDesk is ON: Claude's test windows stay off your screen. Click to turn off.",
+        Mode::On => "QuietDesk is ON: test windows stay off your screen. Click to turn off.",
         Mode::Off => "QuietDesk is OFF: windows open normally. Click to turn on.",
     }
 }
@@ -139,11 +148,15 @@ unsafe fn tray_icon(action: u32, app: &App) {
     }
 }
 
+fn warn(text: &str) {
+    let (text, title) = (wide(text), wide("QuietDesk"));
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+}
+
 fn flip() {
     let wanted = if read_mode() == Mode::On { Mode::Off } else { Mode::On };
     if let Err(error) = set_mode(wanted) {
-        let (text, title) = (wide(format!("The switch reported a problem: {error}")), wide("QuietDesk"));
-        unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+        warn(&format!("The switch reported a problem: {error}"));
     }
     refresh_icon();
 }
@@ -158,51 +171,144 @@ fn refresh_icon() {
     });
 }
 
+/// What a command in the tray's menu does.
+#[derive(Debug, PartialEq)]
+enum Choice {
+    Flip,
+    Sound,
+    Preview,
+    Quit,
+    /// Puts a program on the list of those always on the user's screen.
+    Keep(String),
+    /// Takes one off it.
+    Release(String),
+    /// Asks for a program file to put on it.
+    KeepFile,
+}
+
+unsafe fn add_item(menu: HMENU, flags: u32, id: usize, text: &str) {
+    let text = wide(text);
+    unsafe { AppendMenuW(menu, flags, id, text.as_ptr()) };
+}
+
+/// The tray's menu, and what each of its commands does. The list and the open programs come in, so a test can give its own.
+unsafe fn build_menu(mode: Mode, muting: bool, listed: &[String], open: &[String]) -> (HMENU, Vec<(u32, Choice)>) {
+    unsafe {
+        let mut choices = vec![
+            (MENU_FLIP, Choice::Flip),
+            (MENU_SOUND, Choice::Sound),
+            (MENU_PREVIEW, Choice::Preview),
+            (MENU_QUIT, Choice::Quit),
+            (MENU_ADD_FILE, Choice::KeepFile),
+        ];
+        let menu = CreatePopupMenu();
+        add_item(menu, MF_STRING | MF_DISABLED, 0, if mode == Mode::On { "QuietDesk is ON" } else { "QuietDesk is OFF" });
+        add_item(menu, MF_STRING, MENU_FLIP as usize, if mode == Mode::On { "Turn off" } else { "Turn on" });
+        add_item(menu, if muting { MF_STRING | MF_CHECKED } else { MF_STRING }, MENU_SOUND as usize, "Mute test sounds");
+        add_item(menu, MF_STRING, MENU_PREVIEW as usize, "Show what runs hidden...");
+
+        let kept = CreatePopupMenu();
+        add_item(kept, MF_STRING | MF_DISABLED, 0, if listed.is_empty() {
+            "Programs you add here open on your screen even while QuietDesk is on."
+        } else {
+            "These open on your screen even while QuietDesk is on. Click one to take it off."
+        });
+        AppendMenuW(kept, MF_SEPARATOR, 0, null());
+        for (index, program) in listed.iter().take(MENU_PROGRAMS).enumerate() {
+            let id = MENU_LISTED + index as u32;
+            add_item(kept, MF_STRING | MF_CHECKED, id as usize, program);
+            choices.push((id, Choice::Release(program.clone())));
+        }
+        if !listed.is_empty() {
+            AppendMenuW(kept, MF_SEPARATOR, 0, null());
+        }
+        let to_add = CreatePopupMenu();
+        if open.is_empty() {
+            add_item(to_add, MF_STRING | MF_DISABLED, 0, "No other program has a window open");
+        }
+        for (index, program) in open.iter().take(MENU_PROGRAMS).enumerate() {
+            let id = MENU_OPEN + index as u32;
+            add_item(to_add, MF_STRING, id as usize, program);
+            choices.push((id, Choice::Keep(program.clone())));
+        }
+        add_item(kept, MF_STRING | MF_POPUP, to_add as usize, "Add an open program");
+        add_item(kept, MF_STRING, MENU_ADD_FILE as usize, "Add a program file...");
+        add_item(menu, MF_STRING | MF_POPUP, kept as usize, "Always on your screen");
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add_item(menu, MF_STRING, MENU_QUIT as usize, "Close this icon (the mode keeps working, but test sounds are no longer muted)");
+        (menu, choices)
+    }
+}
+
 unsafe fn show_menu(tray: HWND) {
     unsafe {
-        let menu = CreatePopupMenu();
-        let mode = read_mode();
-        let status = wide(if mode == Mode::On { "QuietDesk is ON" } else { "QuietDesk is OFF" });
-        let flip_text = wide(if mode == Mode::On { "Turn off" } else { "Turn on" });
-        let preview_text = wide("Show what runs hidden...");
-        let sound_text = wide("Mute test sounds");
-        let sound_flags = if quietdesk::sound::muting_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
-        let quit_text = wide("Close this icon (the mode keeps working, but test sounds are no longer muted)");
-        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
-        AppendMenuW(menu, MF_STRING, MENU_FLIP as usize, flip_text.as_ptr());
-        AppendMenuW(menu, sound_flags, MENU_SOUND as usize, sound_text.as_ptr());
-        AppendMenuW(menu, MF_STRING, MENU_PREVIEW as usize, preview_text.as_ptr());
-        // The list is changed with `quietdesk exclude`; here it is only shown.
-        let programs = quietdesk::excluded_programs();
-        let excluded = wide(if programs.is_empty() {
-            "Always on your screen: nothing (quietdesk exclude add <program>)".to_string()
-        } else {
-            format!("Always on your screen: {}", programs.join(", "))
-        });
-        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, excluded.as_ptr());
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit_text.as_ptr());
+        let open = quietdesk::Desktop::real().map(|desktop| quietdesk::open_programs_on(&desktop)).unwrap_or_default();
+        let (menu, choices) = build_menu(read_mode(), quietdesk::sound::muting_enabled(), &quietdesk::excluded_programs(), &open);
         let mut cursor = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cursor);
         // Windows closes a tray menu on a click elsewhere only if its owner is in front; the user's window is invisible.
         SetForegroundWindow(tray);
         let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, cursor.x, cursor.y, 0, tray, null()) as u32;
         PostMessageW(tray, WM_NULL, 0, 0);
+        // Its submenus go with it.
         DestroyMenu(menu);
-        match chosen {
-            MENU_FLIP => flip(),
-            MENU_SOUND => {
+        if let Some((_, choice)) = choices.into_iter().find(|(id, _)| *id == chosen) {
+            choose(tray, choice);
+        }
+    }
+}
+
+unsafe fn choose(tray: HWND, choice: Choice) {
+    unsafe {
+        match choice {
+            Choice::Flip => flip(),
+            Choice::Sound => {
                 if let Err(error) = quietdesk::sound::set_muting(!quietdesk::sound::muting_enabled()) {
-                    let (text, title) = (wide(format!("Could not save that: {error}")), wide("QuietDesk"));
-                    MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                    warn(&format!("Could not save that: {error}"));
                 }
             }
-            MENU_PREVIEW => open_preview(),
-            MENU_QUIT => {
+            Choice::Preview => open_preview(),
+            Choice::Quit => {
                 DestroyWindow(tray);
             }
-            _ => {}
+            Choice::Keep(program) => keep_on_screen(&program, true),
+            Choice::Release(program) => keep_on_screen(&program, false),
+            Choice::KeepFile => {
+                if let Some(path) = pick_program_file(tray) {
+                    keep_on_screen(&path, true);
+                }
+            }
         }
+    }
+}
+
+/// Changes the list. The shims and the keeper read it each time, so it counts from the next command.
+fn keep_on_screen(program: &str, kept: bool) {
+    if let Err(error) = quietdesk::set_excluded(program, kept) {
+        warn(&format!("Could not change the list of programs always on your screen: {error}"));
+    }
+}
+
+/// Windows' own Open dialog, for a program file; its path, or None if the user cancelled.
+unsafe fn pick_program_file(owner: HWND) -> Option<String> {
+    unsafe {
+        let mut file = [0u16; 1024];
+        let filter: Vec<u16> = "Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0".encode_utf16().collect();
+        let title = wide("Choose a program to keep on your screen");
+        let mut dialog: OPENFILENAMEW = std::mem::zeroed();
+        dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        dialog.hwndOwner = owner;
+        dialog.lpstrFilter = filter.as_ptr();
+        dialog.lpstrFile = file.as_mut_ptr();
+        dialog.nMaxFile = file.len() as u32;
+        dialog.lpstrTitle = title.as_ptr();
+        dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+        if GetOpenFileNameW(&mut dialog) == 0 {
+            return None;
+        }
+        let length = file.iter().position(|&unit| unit == 0).unwrap_or(file.len());
+        Some(String::from_utf16_lossy(&file[..length]))
     }
 }
 
@@ -507,5 +613,91 @@ fn main() {
         let _ = sound_guard.join();
         DestroyIcon(icon_on);
         DestroyIcon(icon_off);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, GetSubMenu, MF_BYPOSITION};
+
+    struct Item {
+        text: String,
+        id: u32,
+        checked: bool,
+        disabled: bool,
+        sub: HMENU,
+    }
+
+    /// A menu's items as Windows holds them.
+    fn items(menu: HMENU) -> Vec<Item> {
+        unsafe {
+            (0..GetMenuItemCount(menu))
+                .map(|position| {
+                    let mut text = [0u16; 256];
+                    let length = GetMenuStringW(menu, position as u32, text.as_mut_ptr(), text.len() as i32, MF_BYPOSITION);
+                    let state = GetMenuState(menu, position as u32, MF_BYPOSITION);
+                    Item {
+                        text: String::from_utf16_lossy(&text[..length.max(0) as usize]),
+                        id: GetMenuItemID(menu, position),
+                        checked: state & MF_CHECKED != 0,
+                        disabled: state & MF_DISABLED != 0,
+                        sub: GetSubMenu(menu, position),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn named<'a>(items: &'a [Item], text: &str) -> &'a Item {
+        items.iter().find(|item| item.text == text).unwrap_or_else(|| panic!("no item {text:?}"))
+    }
+
+    /// The list of programs always on the user's screen, as the tray shows it and changes it: those on it ticked, a click takes
+    /// one off, the open programs and a program file put one on. Against a state folder of its own, never the user's list.
+    #[test]
+    fn the_tray_menu_shows_the_list_and_changes_it() {
+        let state = std::env::temp_dir().join(format!("quietdesk-tray-test-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        // The only test in this program, so nothing else reads the state folder meanwhile.
+        unsafe { std::env::set_var("QUIETDESK_DIR", &state) };
+
+        let (menu, _) = unsafe { build_menu(Mode::Off, false, &[], &[]) };
+        let top = items(menu);
+        assert!(named(&top, "QuietDesk is OFF").disabled);
+        assert_eq!(named(&top, "Turn on").id, MENU_FLIP);
+        let kept = items(named(&top, "Always on your screen").sub);
+        assert!(named(&kept, "Programs you add here open on your screen even while QuietDesk is on.").disabled);
+        let nothing_open = items(named(&kept, "Add an open program").sub);
+        assert!(nothing_open.len() == 1 && nothing_open[0].disabled, "with nothing open, it says so");
+        assert_eq!(named(&kept, "Add a program file...").id, MENU_ADD_FILE);
+        unsafe { DestroyMenu(menu) };
+
+        quietdesk::set_excluded("Blender", true).unwrap();
+        let listed = quietdesk::excluded_programs();
+        let open = vec!["code.exe".to_string(), "notepad.exe".to_string()];
+        let (menu, choices) = unsafe { build_menu(Mode::On, true, &listed, &open) };
+        let top = items(menu);
+        assert!(named(&top, "Mute test sounds").checked);
+        let kept = items(named(&top, "Always on your screen").sub);
+        assert!(named(&kept, "These open on your screen even while QuietDesk is on. Click one to take it off.").disabled);
+        let blender = named(&kept, "blender.exe");
+        assert!(blender.checked && !blender.disabled);
+        let offered = items(named(&kept, "Add an open program").sub);
+        assert_eq!(offered.iter().map(|item| item.text.as_str()).collect::<Vec<_>>(), ["code.exe", "notepad.exe"]);
+        let choice = |id: u32| choices.iter().find(|(candidate, _)| *candidate == id).map(|(_, choice)| choice);
+        assert_eq!(choice(blender.id), Some(&Choice::Release("blender.exe".into())));
+        assert_eq!(choice(named(&offered, "notepad.exe").id), Some(&Choice::Keep("notepad.exe".into())));
+        assert_eq!(choice(named(&kept, "Add a program file...").id), Some(&Choice::KeepFile));
+        unsafe { DestroyMenu(menu) };
+
+        // What the clicks do. A program file comes back from the Open dialog as its full path.
+        unsafe {
+            choose(null_mut(), Choice::Keep("notepad.exe".into()));
+            choose(null_mut(), Choice::Release("blender.exe".into()));
+            choose(null_mut(), Choice::Keep(r"C:\Program Files\Some Editor\Editor.exe".into()));
+        }
+        assert_eq!(quietdesk::excluded_programs(), ["editor.exe", "notepad.exe"]);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }

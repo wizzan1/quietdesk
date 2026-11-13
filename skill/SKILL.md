@@ -30,7 +30,7 @@ Use the first that works; each step up is more noticeable.
 
 ## Programs the user always wants on their screen
 
-Each user keeps their own list: `quietdesk exclude add <program>`, `quietdesk exclude remove <program>`, `quietdesk exclude list`. It starts empty and nothing is built in. It is matched by program file name: `blender`, `Blender.exe` and a full path all mean `blender.exe`. It lives in `%LOCALAPPDATA%\QuietDesk\always-on-your-screen`, and `quietdesk status` and the tray menu show it. Change it only when the user asks: what may disturb them is their choice.
+Each user keeps their own list, in the tray menu (**Always on your screen**: add an open program or a program file, untick one to take it off) or with `quietdesk exclude add <program>`, `quietdesk exclude remove <program>`, `quietdesk exclude list`. It starts empty and nothing is built in. It is matched by program file name: `blender`, `Blender.exe` and a full path all mean `blender.exe`. It lives in `%LOCALAPPDATA%\QuietDesk\always-on-your-screen`, and `quietdesk status` and the tray menu show it. Change it only when the user asks: what may disturb them is their choice.
 
 - While the mode is on, a command (one Bash or PowerShell tool call, a hook, an MCP server's start) whose text names a listed program, as a word or as the end of a path, runs on the real screen as a whole, with no prefix: `blender scene.blend`, `& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe"`, `Start-Process blender`. Its windows open normally on the user's screen.
 - Everything else that command starts is on the real screen too. Start the listed program in a command of its own, and keep tests out of it. A mere mention also counts (`Get-Process blender`); that loses nothing but quiet.

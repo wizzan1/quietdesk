@@ -45,7 +45,8 @@ quietdesk exclude list                shows your list
 
 <program> is its name, with or without .exe, or its full path: blender, Blender.exe and
 \"C:\\Program Files\\Blender Foundation\\Blender 5.2\\blender.exe\" all mean blender.exe.
-A Claude Code command that starts a program on your list runs on your screen, from the next command on.";
+A Claude Code command that starts a program on your list runs on your screen, from the next command on.
+The tray icon's menu, Always on your screen, changes the same list.";
 
 const WINDOW_USAGE: &str = "\
 Windows, wherever they run. <window> is 0xHANDLE, a process id, or part of the title, class or
