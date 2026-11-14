@@ -139,7 +139,7 @@ wander onto it, and follows everything a command starts, so the command's window
 ## What it cannot hide
 
 - **A window on the virtual monitor whose program is busy as it opens.** A program that puts its own window on your screen has it
-  moved off within milliseconds, but only once it is free: Windows lets only a window's own thread move it. One that is busy as its
+  moved off within about 40 ms, but only once it is free: Windows lets only a window's own thread move it. One that is busy as its
   window opens, as a game is while it loads, keeps it on your screen until then. The one way to hide it from outside would change how
   it draws, and so what is tested.
 - **Sound from the virtual monitor that starts before its program is known as a test's,** such as one started outside the command:
@@ -184,7 +184,7 @@ the real screen in every number:
 | Timers | The same: `Sleep(1)` is a median of 1.50 ms in both places |
 | A command's extra cost | About 30 ms through the shims; about 70 ms through `quietdesk monitor` against 57 ms with no monitor |
 | A hidden test's sound | Muted as soon as it opens its sound, in 10 of 10 runs; looking every 0.2 s instead, it played for 25 to 190 ms |
-| A window that opens on your screen, on the virtual monitor | Off it in about 1 ms (at most 19) when its program is free; as long as the program is busy otherwise |
+| A window that opens on your screen, on the virtual monitor | Off it in 1 to 38 ms when its program is free, a median of 23 over 25 measurements (the keeper looks every 25 ms); as long as the program is busy otherwise |
 | Background cost | The tray app and the keeper about 0.3 % of one core each |
 
 What slows a test run is sharing the GPU with your own game, not the hiding: with a full-screen game using about 78 % of the GPU,

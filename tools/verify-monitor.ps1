@@ -4,7 +4,7 @@ outside any job and from inside a job nothing may leave, as Claude Code's Bash t
 on the monitor, also when the command that started it ended at once. Exit codes carry through, the log stays quiet and no file is left.
 The monitor is scaled as your main screen is.
 When Windows switches the monitor off, as a change of your screens can, it is shown again where it was, with no new plug-in. A window that
-opens on your screen is off it within a few milliseconds when its program is free; one whose program is busy as it opens stays until the
+opens on your screen is off it within 50 ms when its program is free (the keeper looks every 25 ms); one whose program is busy as it opens stays until the
 program is free again, because Windows lets only a window's own thread move it.
 A window that belongs on your screen and opens on the monitor, of a program on your list (`quietdesk exclude`) or started through
 `quietdesk visible`, comes to your main screen, and so does one that lands there again and again, or whose program is put on the
