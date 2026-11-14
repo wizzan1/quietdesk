@@ -121,7 +121,7 @@ one level deeper (`SHLVL`), which the tests check. An MCP server starts as Claud
 program with its arguments, a batch file such as `npx` through `cmd.exe`. With the mode off they only pass commands through. Your
 own terminals are left alone: the PowerShell shim acts only for what Claude Code starts.
 
-The virtual monitor belongs to a small keeper process. It has your main screen's size, sits at its corner so your mouse does not
+The virtual monitor belongs to a small keeper process. It has your main screen's size and scale, sits at its corner so your mouse does not
 wander onto it, and follows everything a command starts, so the command's windows end up there and the focus comes back to you.
 
 ## What behaves differently hidden

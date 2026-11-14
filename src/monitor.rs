@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY,
     DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
 };
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -345,7 +345,7 @@ fn free_corner(main: Bounds, screens: &[Bounds], width: i32, height: i32) -> Opt
         })
 }
 
-/// Gives the monitor the main screen's size and the nearest refresh rate it has, so a program on it sees the display it
+/// Gives the monitor the main screen's size and the nearest refresh rate it has (its scale follows once it is shown), so a program on it sees the display it
 /// would see on the real screen, and places it at a corner where the user's mouse cannot wander onto it.
 fn set_up_like_the_main_screen(monitor: &Display) {
     let displays = active_displays();
@@ -526,6 +526,104 @@ fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
     (unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0).then(|| text_of(&name.viewGdiDeviceName))
 }
 
+/// Windows' display scales, as its Settings app offers them. Its calls give a screen's scale in steps from the one it recommends for
+/// that display, and the first step, 100 %, is always offered.
+const SCALE_STEPS: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+/// Not in Windows' headers: the calls its Settings app uses to read and set a screen's scale. Wine has them too.
+const GET_SCALE: i32 = -3;
+const SET_SCALE: i32 = -4;
+
+#[repr(C)]
+struct ScaleGet {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    lowest: i32,
+    current: i32,
+    highest: i32,
+}
+
+#[repr(C)]
+struct ScaleSet {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    step: i32,
+}
+
+/// A screen's scale, in Windows' steps from the one it recommends for that display: the lowest it offers (100 %), the one in use and
+/// the highest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Scale {
+    lowest: i32,
+    current: i32,
+    highest: i32,
+}
+
+impl Scale {
+    fn percent_at(&self, step: i32) -> Option<u32> {
+        SCALE_STEPS.get(usize::try_from(step - self.lowest).ok()?).copied()
+    }
+
+    /// The scale in use, in percent.
+    fn percent(&self) -> Option<u32> {
+        self.percent_at(self.current)
+    }
+
+    /// The step to set for the scale nearest `percent` that this screen offers, or None when it has that scale already.
+    fn step_towards(&self, percent: u32) -> Option<i32> {
+        let nearest = (self.lowest..=self.highest)
+            .filter_map(|step| Some((step, self.percent_at(step)?.abs_diff(percent))))
+            .min_by_key(|&(_, distance)| distance)?
+            .0;
+        (nearest != self.current).then_some(nearest)
+    }
+}
+
+fn scale_of(path: &DISPLAYCONFIG_PATH_INFO) -> Option<Scale> {
+    let mut packet: ScaleGet = unsafe { std::mem::zeroed() };
+    packet.header.r#type = GET_SCALE;
+    packet.header.size = size_of::<ScaleGet>() as u32;
+    packet.header.adapterId = path.sourceInfo.adapterId;
+    packet.header.id = path.sourceInfo.id;
+    (unsafe { DisplayConfigGetDeviceInfo(&mut packet.header) } == 0)
+        .then_some(Scale { lowest: packet.lowest, current: packet.current, highest: packet.highest })
+}
+
+fn set_scale(path: &DISPLAYCONFIG_PATH_INFO, step: i32) -> io::Result<()> {
+    let mut packet: ScaleSet = unsafe { std::mem::zeroed() };
+    packet.header.r#type = SET_SCALE;
+    packet.header.size = size_of::<ScaleSet>() as u32;
+    packet.header.adapterId = path.sourceInfo.adapterId;
+    packet.header.id = path.sourceInfo.id;
+    packet.step = step;
+    let error = unsafe { DisplayConfigSetDeviceInfo(&packet.header) };
+    if error == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(error)) }
+}
+
+/// Gives the monitor the main screen's scale, so a program on it is scaled as it would be there. Windows picks a display's scale
+/// from its size: for the monitor at 2560x1440 it chose 125 % against the main screen's 100 %, so a window there was scaled as on
+/// no screen of the user's. Windows keeps the scale it is given for that display, so from then on this finds it right and changes
+/// nothing. It changes the monitor alone: none of the user's screens or windows.
+fn match_the_main_screen_scale(monitor: &Display) {
+    let displays = active_displays();
+    let Some(main) = displays.iter().find(|d| d.is_primary && !d.is_virtual) else { return };
+    let layout = match Layout::now() {
+        Ok(layout) => layout,
+        Err(error) => {
+            note_problem(&format!("could not read your screens to give the virtual monitor the main screen's scale: {error}"));
+            return;
+        }
+    };
+    let (Some(main_path), Some(monitor_path)) = (layout.path_of(&text_of(&main.name)), layout.path_of(&text_of(&monitor.name))) else { return };
+    let (Some(main_scale), Some(monitor_scale)) = (scale_of(&layout.paths[main_path]), scale_of(&layout.paths[monitor_path])) else {
+        note_problem("could not read the main screen's or the virtual monitor's scale, so the monitor keeps the one Windows chose");
+        return;
+    };
+    let Some(percent) = main_scale.percent() else { return };
+    if let Some(step) = monitor_scale.step_towards(percent)
+        && let Err(error) = set_scale(&layout.paths[monitor_path], step)
+    {
+        note_problem(&format!("could not give the virtual monitor the main screen's scale of {percent} %: {error}"));
+    }
+}
+
 /// Shows the user's screens exactly as they had them before the monitor came (`before`), with the monitor at a corner beside them,
 /// and has Windows keep that. Plugging the monitor in makes Windows apply what it last chose for the new set of screens: that can
 /// light up a screen the user had turned off, or move one, and with "PC screen only" Windows switches everything else off again a
@@ -585,6 +683,7 @@ fn settle(monitor: &Display, before: Option<&Layout>) -> Option<(Bounds, Option<
             None
         }
     };
+    match_the_main_screen_scale(monitor);
     Some((bounds_of(monitor)?, path))
 }
 
@@ -1446,8 +1545,8 @@ fn ask_the_keeper_to_follow(folder: &Path, name: &str) -> bool {
 mod tests {
     use super::{
         Bounds, CommandJobs, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
-        DISPLAYCONFIG_PATH_MODE_IDX_INVALID, Family, KEEPER_FOLLOWS, Layout, POINTL, apart, ask_the_keeper_to_follow, free_corner, own_job,
-        process_table,
+        DISPLAYCONFIG_PATH_MODE_IDX_INVALID, Family, KEEPER_FOLLOWS, Layout, POINTL, Scale, apart, ask_the_keeper_to_follow, free_corner,
+        own_job, process_table,
     };
     use windows_sys::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_MODE;
     use crate::wide;
@@ -1633,6 +1732,25 @@ mod tests {
         // None of theirs at all: nothing to give it to.
         let mut only_the_monitor = Layout { paths: vec![path_on(0)], modes: vec![screen_at(0, 0, 2560, 1440)] };
         assert!(only_the_monitor.place_at_a_corner(0, None).is_err(), "a layout with no screen of theirs was accepted");
+    }
+
+    /// Windows gave the monitor 125 % (its recommended step, so 100 % one step below) against the main screen's 100 %: the monitor
+    /// goes one step down. A monitor at the main screen's scale is left alone, and one that cannot reach it gets the nearest it offers.
+    #[test]
+    fn the_monitor_takes_the_main_screen_s_scale() {
+        let windows_chose = Scale { lowest: -1, current: 0, highest: 6 };
+        assert_eq!(windows_chose.percent(), Some(125));
+        assert_eq!(windows_chose.step_towards(100), Some(-1), "the monitor keeps 125 % against a main screen at 100 %");
+        assert_eq!(Scale { current: -1, ..windows_chose }.step_towards(100), None, "a monitor at 100 % is set again");
+        assert_eq!(windows_chose.step_towards(125), None, "a monitor already at the main screen's scale is set again");
+        assert_eq!(windows_chose.step_towards(150), Some(1));
+        // A main screen at a scale the monitor does not offer: the nearest it does, never a step past its highest.
+        let small = Scale { lowest: 0, current: 0, highest: 2 };
+        assert_eq!(small.step_towards(300), Some(2), "a step past the monitor's highest was asked for");
+        assert_eq!(small.step_towards(110), None, "110 % is nearest 100 %, which it has");
+        // A step Windows' Settings app does not know reads as no scale, and is never asked for.
+        assert_eq!(Scale { lowest: 0, current: 20, highest: 20 }.percent(), None);
+        assert_eq!(Scale { lowest: 0, current: 20, highest: 20 }.step_towards(100), Some(0));
     }
 
     /// How long the test's children live, in pings a second apart: long enough to be seen, gone soon after a test, as killing

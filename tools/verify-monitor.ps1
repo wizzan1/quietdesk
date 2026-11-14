@@ -2,6 +2,7 @@
 Proves that what runs through `quietdesk monitor` is followed from any shell, against the installed programs and the running keeper: from
 outside any job and from inside a job nothing may leave, as Claude Code's Bash tool runs. A program that places its own window ends up
 on the monitor, also when the command that started it ended at once. Exit codes carry through, the log stays quiet and no file is left.
+The monitor is scaled as your main screen is.
 When Windows switches the monitor off, as a change of your screens can, it is shown again where it was, with no new plug-in. A window that
 opens on your screen is off it within a few milliseconds when its program is free; one whose program is busy as it opens stays until the
 program is free again, because Windows lets only a window's own thread move it.
@@ -87,6 +88,30 @@ $left = [int]$Matches[1]
 $top = [int]$Matches[2]
 $right = $left + [int]$Matches[3]
 $bottom = $top + [int]$Matches[4]
+
+# Scaled as the main screen is, so a program on it is scaled as it would be on your screen: Windows chose 125 % for it against 100 %.
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class QuietDeskScale {
+    [StructLayout(LayoutKind.Sequential)] struct Point { public int X, Y; }
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint x, out uint y);
+    // The display's own scale, read as a program that follows each display's scale reads it. 0 where no display is.
+    public static uint At(int x, int y) {
+        IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            uint dpiX, dpiY;
+            IntPtr monitor = MonitorFromPoint(new Point { X = x, Y = y }, 0);
+            return monitor != IntPtr.Zero && GetDpiForMonitor(monitor, 0, out dpiX, out dpiY) == 0 ? dpiX : 0;
+        }
+        finally { SetThreadDpiAwarenessContext(before); }
+    }
+}
+'@
+$mainDpi = [QuietDeskScale]::At(0, 0)
+$monitorDpi = [QuietDeskScale]::At($left + 1, $top + 1)
+Report 'scaled as your main screen' ($mainDpi -ne 0 -and $monitorDpi -eq $mainDpi) ("main screen {0} %, monitor {1} %" -f [math]::Round($mainDpi * 100 / 96), [math]::Round($monitorDpi * 100 / 96))
 
 $here = Join-Path ([IO.Path]::GetTempPath()) "quietdesk-verify-monitor-$PID"
 New-Item -ItemType Directory -Force -Path $here | Out-Null
