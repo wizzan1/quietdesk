@@ -56,6 +56,11 @@ you turn it on. Installing changes these, and `pwsh -File tools\uninstall.ps1` t
 | `~\.claude\skills\quietdesk` | A skill: how to use it, and what differs when hidden |
 | `HKCU\...\Run` | The tray icon, at sign-in |
 
+**If the tray icon is gone,** `quietdesk status` says so, and test sounds are no longer muted. `quietdesk start-tray` brings it
+back (with the mode on, that plugs the virtual monitor in: the connect sound once). An antivirus may stop QuietDesk or quarantine
+its programs: they are unsigned, put their own `pwsh.exe` first on your PATH and run programs on a hidden desktop, as some
+malware does. Restore them, and add an exception for `%LOCALAPPDATA%\QuietDesk\bin` if you trust the build.
+
 ## Turning it on and off
 
 - Click the tray icon: a red disc with a white bar means on, a grey ring means off. Right-click it for the menu.
@@ -145,6 +150,8 @@ wander onto it, and follows everything a command starts, so the command's window
 - **Hooks written with `"args"`:** Claude Code starts them itself, not through `CLAUDE_CODE_SHELL_PREFIX`, so they are not hidden.
   Hooks written as a command line are.
 - **An MCP server already running when you flip the mode** stays where it started: reconnect it (`/mcp`) to move it.
+- **What a test asks to show.** A script that runs a step with `quietdesk visible` puts it on your screen on purpose, usually a
+  check that needs the keyboard focus or your real display. If a window shows up with the mode on, look there first.
 - **What another program opens for a command (not tested):** an elevation prompt, a program that hands over to a copy already on
   your screen, and what Windows opens on request, such as a web page, a folder or a Store app. Tools the Claude app starts itself,
   such as its preview browser, do not pass through QuietDesk.
